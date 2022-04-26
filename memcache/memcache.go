@@ -70,6 +70,17 @@ const (
 	// DefaultMaxIdleConns is the default maximum number of idle connections
 	// kept for any single address.
 	DefaultMaxIdleConns = 2
+
+	Base64MetaFlag            = "b"
+	CasTokenResponseMetaFlag  = "c"
+	CompareCasValueFlag       = "C"
+	SetClientFlagsToTokenFlag = "F"
+	InvalidateFlag            = "I"
+	ReturnKeyAsTokenFlag      = "k"
+	OpaqueTokenFlag           = "O"
+	NoReplySemanticsFlag      = "q"
+	UpdateTTLTokenMetaFlag    = "T"
+	ModeFlag                  = "M"
 )
 
 const buffered = 8 // arbitrary buffered channel size, for readability
@@ -113,6 +124,11 @@ var (
 
 	resultClientErrorPrefix = []byte("CLIENT_ERROR ")
 	versionPrefix           = []byte("VERSION")
+
+	metaResultStored    = []byte("HD")
+	metaResultNotStored = []byte("NS")
+	metaResultExists    = []byte("EX")
+	metaResultNotFound  = []byte("NF")
 )
 
 // New returns a memcache client using the provided server(s)
@@ -710,4 +726,161 @@ func (c *Client) incrDecr(verb, key string, delta uint64) (uint64, error) {
 		return nil
 	})
 	return val, err
+}
+
+type MetaSetItem struct {
+	Key    string
+	Flags  MetaSetFlags
+	Length int32
+	Value  []byte
+}
+
+type MetaSetFlags struct {
+	// use if the key provided is base 64 encoded
+	// equivalent to the b flag
+	IsKeyBase64 bool
+
+	// use if you wish to see the cas token as a part of the response
+	// equivalent to the c flag
+	ReturnCasTokenInResponse bool
+
+	// use if you provide a cas token with CompareCasTokenToUpdateValue attribute and it is older than the item's CAS
+	// note: only functional when combined with the CompareCasTokenToUpdateValue attribute
+	// equivalent to the I flag
+	Invalidate bool
+
+	// use if you want to get the key as a part of the response
+	// equivalent to the k flag
+	ReturnKeyInResponse bool
+
+	// equivalent to the q flag
+	UseNoReplySemanticsForResponse bool
+
+	// use if only want to store a value if the supplied token matches the current CAS token of the item
+	// equivalent to the C<token> flag
+	CompareCasTokenToUpdateValue *uint64
+
+	// use if you want to set client flags to a token
+	// equivalent to the F<token> flag
+	ClientFlagToken *uint32
+
+	// use if you want to consume a token and copy back with a response
+	// equivalent to the O<token> flag
+	OpaqueToken *string
+
+	// use if you want to set the TTL for the item
+	// equivalent to the T<token> flag
+	UpdateTTLToken *uint32
+
+	// use if you want to switch modes
+	// E: "add" command. LRU bump and return NS if item exists, else add
+	// A: "append" command. If item exists, append the new value to its data
+	// P: "prepend" command. If item exists, prepend the new value to its data
+	// R: "replace" command. Set only if item exists, replace its value
+	// S: "set" command. The default mode, added for completeness
+	// equivalent to the M<token> flag
+	SetModeToken *string
+}
+
+func (c *Client) MetaSet(metaItem *MetaSetItem) error {
+	return c.onMetaItem(metaItem, (*Client).metaSet)
+}
+
+func (c *Client) onMetaItem(item *MetaSetItem, fn func(*Client, *bufio.ReadWriter, *MetaSetItem) error) error {
+	addr, err := c.selector.PickServer(item.Key)
+	if err != nil {
+		return err
+	}
+	cn, err := c.getConn(addr)
+	if err != nil {
+		return err
+	}
+	defer cn.condRelease(&err)
+	if err = fn(c, cn.rw, item); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (c *Client) metaSet(rw *bufio.ReadWriter, item *MetaSetItem) error {
+	return c.processMetaSet(rw, item)
+}
+
+func (c *Client) processMetaSet(rw *bufio.ReadWriter, item *MetaSetItem) error {
+	if !legalKey(item.Key) {
+		return ErrMalformedKey
+	}
+
+	command := c.parseFlagsForMetaSet(item)
+
+	var err error
+	_, err = fmt.Fprintf(rw, command)
+
+	if err != nil {
+		return nil
+	}
+	if _, err = rw.Write(item.Value); err != nil {
+		return err
+	}
+	if _, err := rw.Write(crlf); err != nil {
+		return err
+	}
+	if err := rw.Flush(); err != nil {
+		return err
+	}
+	line, err := rw.ReadSlice('\n')
+	if err != nil {
+		return err
+	}
+	switch {
+	case bytes.HasPrefix(line, metaResultStored):
+		return nil
+	case bytes.HasPrefix(line, metaResultNotStored):
+		return ErrNotStored
+	case bytes.HasPrefix(line, metaResultExists):
+		return ErrCASConflict
+	case bytes.HasPrefix(line, metaResultNotFound):
+		return ErrCacheMiss
+	}
+	return fmt.Errorf("memcache: unexpected response line from ms: %q", string(line))
+}
+
+func (c *Client) parseFlagsForMetaSet(metaItem *MetaSetItem) string {
+	var commandBuilder strings.Builder
+	commandBuilder.WriteString(fmt.Sprintf("ms %s %d", metaItem.Key, len(metaItem.Value)))
+
+	itemFlags := metaItem.Flags
+	if itemFlags.IsKeyBase64 {
+		commandBuilder.WriteString(fmt.Sprintf(" %s", Base64MetaFlag))
+	}
+	if itemFlags.ReturnCasTokenInResponse {
+		commandBuilder.WriteString(fmt.Sprintf(" %s", CasTokenResponseMetaFlag))
+	}
+	if itemFlags.Invalidate {
+		commandBuilder.WriteString(fmt.Sprintf(" %s", InvalidateFlag))
+	}
+	if itemFlags.ReturnKeyInResponse {
+		commandBuilder.WriteString(fmt.Sprintf(" %s", ReturnKeyAsTokenFlag))
+	}
+	if itemFlags.UseNoReplySemanticsForResponse {
+		commandBuilder.WriteString(fmt.Sprintf(" %s", NoReplySemanticsFlag))
+	}
+	if itemFlags.CompareCasTokenToUpdateValue != nil {
+		commandBuilder.WriteString(fmt.Sprintf(" %s%d", CompareCasValueFlag, *itemFlags.CompareCasTokenToUpdateValue))
+	}
+	if itemFlags.ClientFlagToken != nil {
+		commandBuilder.WriteString(fmt.Sprintf(" %s%d", SetClientFlagsToTokenFlag, *itemFlags.ClientFlagToken))
+	}
+	if itemFlags.OpaqueToken != nil {
+		commandBuilder.WriteString(fmt.Sprintf(" %s%s", OpaqueTokenFlag, *itemFlags.OpaqueToken))
+	}
+	if itemFlags.UpdateTTLToken != nil {
+		commandBuilder.WriteString(fmt.Sprintf(" %s%d", UpdateTTLTokenMetaFlag, *itemFlags.UpdateTTLToken))
+	}
+	if itemFlags.SetModeToken != nil {
+		commandBuilder.WriteString(fmt.Sprintf(" %s%s", ModeFlag, *itemFlags.SetModeToken))
+	}
+	commandBuilder.WriteString("\r\n")
+
+	return commandBuilder.String()
 }

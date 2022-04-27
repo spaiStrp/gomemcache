@@ -71,20 +71,30 @@ const (
 	// kept for any single address.
 	DefaultMaxIdleConns = 2
 
-	Base64MetaFlag            = "b"
-	CasTokenResponseMetaFlag  = "c"
-	CompareCasValueFlag       = "C"
-	SetClientFlagsToTokenFlag = "F"
-	InvalidateFlag            = "I"
-	ReturnKeyAsTokenFlag      = "k"
-	OpaqueTokenFlag           = "O"
-	NoReplySemanticsFlag      = "q"
-	UpdateTTLTokenMetaFlag    = "T"
-	ModeFlag                  = "M"
-	TTLResponseMetaFlag       = "t"
+	base64MetaFlag                = "b"
+	casTokenResponseMetaFlag      = "c"
+	compareCasValueTokenMetaFlag  = "C"
+	setClientFlagsToTokenMetaFlag = "F"
+	invalidateMetaFlag            = "I"
+	returnKeyAsTokenMetaFlag      = "k"
+	opaqueTokenMetaFlag           = "O"
+	noReplySemanticsMetaFlag      = "q"
+	updateTTLTokenMetaFlag        = "T"
+	modeTokenMetaFlag             = "M"
+	ttlResponseMetaFlag           = "t"
 )
 
 const buffered = 8 // arbitrary buffered channel size, for readability
+
+type MetaSetMode string
+
+const (
+	Add     MetaSetMode = "E"
+	Append  MetaSetMode = "A"
+	Prepend MetaSetMode = "P"
+	Replace MetaSetMode = "R"
+	Set     MetaSetMode = "S"
+)
 
 // resumableError returns true if err is only a protocol-level cache error.
 // This is used to determine whether or not a server connection should
@@ -731,10 +741,9 @@ func (c *Client) incrDecr(verb, key string, delta uint64) (uint64, error) {
 }
 
 type MetaSetItem struct {
-	Key    string
-	Flags  MetaSetFlags
-	Length int32
-	Value  []byte
+	Key   string
+	Flags MetaSetFlags
+	Value []byte
 }
 
 type MetaResponseMetadata struct {
@@ -768,6 +777,15 @@ type MetaSetFlags struct {
 	// equivalent to the q flag
 	UseNoReplySemanticsForResponse bool
 
+	// use if you want to switch modes
+	// E: "add" command. LRU bump and return NS if item exists, else add
+	// A: "append" command. If item exists, append the new value to its data
+	// P: "prepend" command. If item exists, prepend the new value to its data
+	// R: "replace" command. Set only if item exists, replace its value
+	// S: "set" command. The default mode, added for completeness
+	// equivalent to the M<token> flag
+	SetModeToken MetaSetMode
+
 	// use if only want to store a value if the supplied token matches the current CAS token of the item
 	// equivalent to the C<token> flag
 	CompareCasTokenToUpdateValue *uint64
@@ -782,16 +800,7 @@ type MetaSetFlags struct {
 
 	// use if you want to set the TTL for the item
 	// equivalent to the T<token> flag
-	UpdateTTLToken *uint32
-
-	// use if you want to switch modes
-	// E: "add" command. LRU bump and return NS if item exists, else add
-	// A: "append" command. If item exists, append the new value to its data
-	// P: "prepend" command. If item exists, prepend the new value to its data
-	// R: "replace" command. Set only if item exists, replace its value
-	// S: "set" command. The default mode, added for completeness
-	// equivalent to the M<token> flag
-	SetModeToken *string
+	UpdateTTLToken *int32
 }
 
 func (c *Client) MetaSet(metaItem *MetaSetItem) (metaDataResponse *MetaResponseMetadata, err error) {
@@ -843,14 +852,11 @@ func (c *Client) processMetaSet(rw *bufio.ReadWriter, item *MetaSetItem, cb func
 	}
 	switch {
 	case bytes.HasPrefix(response, metaResultStored):
-		// the first two characters are being processed in this switch-case block, the other cases are all errors
-		// so we don't need to save them into the meta data object
-		responseMetadataComponents := strings.Fields(string(response))[1:]
-		var metaResponse *MetaResponseMetadata
-		if metaResponse, err = createMetaResponseMetadata(responseMetadataComponents); err != nil {
+		metaResponseMetadata := new(MetaResponseMetadata)
+		if err = parseMetaResponseMetadata(response, metaResponseMetadata); err != nil {
 			return err
 		}
-		cb(metaResponse)
+		cb(metaResponseMetadata)
 		return nil
 	case bytes.HasPrefix(response, metaResultNotStored):
 		return ErrNotStored
@@ -880,21 +886,21 @@ func getMemCacheErrorFromResponse(response []byte) error {
 //response of meta commands contain flags which are single characters.
 // For ex if MetaGetFlags.ReturnTTLRemainingSecondsInResponse is set to true then response
 //will contain t300. Here 300 is the amount of TTL remaining in Seconds
-func createMetaResponseMetadata(metaResponseMetadata []string) (*MetaResponseMetadata, error) {
-
+func parseMetaResponseMetadata(response []byte, respMetadata *MetaResponseMetadata) error {
+	// the first two characters are being processed in this switch-case block, the other cases are all errors
+	// so we don't need to save them into the meta data object
+	metaResponseMetadata := strings.Fields(string(response))[1:]
 	if len(metaResponseMetadata) != 0 {
-		respMetadata := new(MetaResponseMetadata)
-
 		for _, metadata := range metaResponseMetadata {
 			if err := populateMetaResponseMetadata(metadata[0:1], metadata[1:], respMetadata); err != nil {
-				return nil, err
+				return err
 			}
 		}
 
-		return respMetadata, nil
+		return nil
 	}
 
-	return nil, nil
+	return nil
 }
 
 //populates the MetaResponseMetadata based on the response flags
@@ -905,19 +911,19 @@ func populateMetaResponseMetadata(respFlagKey string,
 	var err error
 
 	switch {
-	case respFlagKey == CasTokenResponseMetaFlag:
+	case respFlagKey == casTokenResponseMetaFlag:
 		var casId uint64
 		if casId, err = strconv.ParseUint(respValue, 10, 64); err != nil {
 			return err
 		}
 		respMetadata.CasId = &casId
-	case respFlagKey == ReturnKeyAsTokenFlag:
+	case respFlagKey == returnKeyAsTokenMetaFlag:
 		key := respValue
 		respMetadata.Key = &key
-	case respFlagKey == OpaqueTokenFlag:
+	case respFlagKey == opaqueTokenMetaFlag:
 		token := respValue
 		respMetadata.OpaqueValue = &token
-	case respFlagKey == TTLResponseMetaFlag:
+	case respFlagKey == ttlResponseMetaFlag:
 		var ttl int64
 		if ttl, err = strconv.ParseInt(respValue, 10, 32); err != nil {
 			return err
@@ -935,34 +941,34 @@ func (c *Client) parseFlagsForMetaSet(metaItem *MetaSetItem) string {
 
 	itemFlags := metaItem.Flags
 	if itemFlags.IsKeyBase64 {
-		commandBuilder.WriteString(fmt.Sprintf(" %s", Base64MetaFlag))
+		commandBuilder.WriteString(fmt.Sprintf(" %s", base64MetaFlag))
 	}
 	if itemFlags.ReturnCasTokenInResponse {
-		commandBuilder.WriteString(fmt.Sprintf(" %s", CasTokenResponseMetaFlag))
+		commandBuilder.WriteString(fmt.Sprintf(" %s", casTokenResponseMetaFlag))
 	}
 	if itemFlags.Invalidate {
-		commandBuilder.WriteString(fmt.Sprintf(" %s", InvalidateFlag))
+		commandBuilder.WriteString(fmt.Sprintf(" %s", invalidateMetaFlag))
 	}
 	if itemFlags.ReturnKeyInResponse {
-		commandBuilder.WriteString(fmt.Sprintf(" %s", ReturnKeyAsTokenFlag))
+		commandBuilder.WriteString(fmt.Sprintf(" %s", returnKeyAsTokenMetaFlag))
 	}
 	if itemFlags.UseNoReplySemanticsForResponse {
-		commandBuilder.WriteString(fmt.Sprintf(" %s", NoReplySemanticsFlag))
+		commandBuilder.WriteString(fmt.Sprintf(" %s", noReplySemanticsMetaFlag))
 	}
 	if itemFlags.CompareCasTokenToUpdateValue != nil {
-		commandBuilder.WriteString(fmt.Sprintf(" %s%d", CompareCasValueFlag, *itemFlags.CompareCasTokenToUpdateValue))
+		commandBuilder.WriteString(fmt.Sprintf(" %s%d", compareCasValueTokenMetaFlag, *itemFlags.CompareCasTokenToUpdateValue))
 	}
 	if itemFlags.ClientFlagToken != nil {
-		commandBuilder.WriteString(fmt.Sprintf(" %s%d", SetClientFlagsToTokenFlag, *itemFlags.ClientFlagToken))
+		commandBuilder.WriteString(fmt.Sprintf(" %s%d", setClientFlagsToTokenMetaFlag, *itemFlags.ClientFlagToken))
 	}
 	if itemFlags.OpaqueToken != nil {
-		commandBuilder.WriteString(fmt.Sprintf(" %s%s", OpaqueTokenFlag, *itemFlags.OpaqueToken))
+		commandBuilder.WriteString(fmt.Sprintf(" %s%s", opaqueTokenMetaFlag, *itemFlags.OpaqueToken))
 	}
 	if itemFlags.UpdateTTLToken != nil {
-		commandBuilder.WriteString(fmt.Sprintf(" %s%d", UpdateTTLTokenMetaFlag, *itemFlags.UpdateTTLToken))
+		commandBuilder.WriteString(fmt.Sprintf(" %s%d", updateTTLTokenMetaFlag, *itemFlags.UpdateTTLToken))
 	}
-	if itemFlags.SetModeToken != nil {
-		commandBuilder.WriteString(fmt.Sprintf(" %s%s", ModeFlag, *itemFlags.SetModeToken))
+	if itemFlags.SetModeToken != "" {
+		commandBuilder.WriteString(fmt.Sprintf(" %s%s", modeTokenMetaFlag, itemFlags.SetModeToken))
 	}
 	commandBuilder.WriteString("\r\n")
 

@@ -283,9 +283,9 @@ func testMetaCommandsWithClient(t *testing.T, c *Client, checkErr func(err error
 	checkErr(err, "first meta set(%s): %v", key, err)
 
 	// set using the same cas token as what was last set
-	var newTTL uint32 = 900000
+	var newTTL int32 = 900000
 	var clientFlagToken uint32 = 90
-	metaFoo = &MetaSetItem{Key: key, Value: []byte("new_bah_val"), Flags: MetaSetFlags{CompareCasTokenToUpdateValue: *&casToken, ClientFlagToken: &clientFlagToken, UpdateTTLToken: &newTTL}}
+	metaFoo = &MetaSetItem{Key: key, Value: []byte("new_bah_val"), Flags: MetaSetFlags{CompareCasTokenToUpdateValue: casToken, ClientFlagToken: &clientFlagToken, UpdateTTLToken: &newTTL}}
 	response, err = c.MetaSet(metaFoo)
 	checkErr(err, "second meta set(%s): %v", key, err)
 
@@ -297,11 +297,40 @@ func testMetaCommandsWithClient(t *testing.T, c *Client, checkErr func(err error
 		t.Errorf("third meta set(%s) expected an error to be returned but got none", key)
 	}
 
+	// set using the append mode
+	metaFoo = &MetaSetItem{Key: key, Value: []byte("append_value_to_existing"), Flags: MetaSetFlags{SetModeToken: Append}}
+	_, err = c.MetaSet(metaFoo)
+	checkErr(err, "fourth meta set(%s): %v", key, err)
+
+	// set using the prepend mode
+	metaFoo = &MetaSetItem{Key: key, Value: []byte("prepend_value_to_existing"), Flags: MetaSetFlags{SetModeToken: Prepend}}
+	_, err = c.MetaSet(metaFoo)
+	checkErr(err, "fifth meta set(%s): %v", key, err)
+
+	// set using the add mode and existing key
+	// will fail to store and return ErrNotStored error because key is in use
+	metaFoo = &MetaSetItem{Key: key, Value: []byte("add_value_to_existing"), Flags: MetaSetFlags{SetModeToken: Add}}
+	_, err = c.MetaSet(metaFoo)
+	if err == nil {
+		t.Errorf("sixth meta set(%s) expected an error to be returned but got none", key)
+	}
+
+	// set using the replace mode
+	metaFoo = &MetaSetItem{Key: key, Value: []byte("add_value_to_existing"), Flags: MetaSetFlags{SetModeToken: Replace}}
+	_, err = c.MetaSet(metaFoo)
+	checkErr(err, "seventh meta set(%s): %v", key, err)
+
+	// set using the add mode
+	// will fail to store and return ErrNotStored error because key is in use
+	metaFoo = &MetaSetItem{Key: "new_key", Value: []byte("add_value_to_existing"), Flags: MetaSetFlags{SetModeToken: Add}}
+	_, err = c.MetaSet(metaFoo)
+	checkErr(err, "eighth meta set(%s): %v", key, err)
+
 	// set using base64 encoded string (non-encoded is newBaseKey)
 	key = "bmV3QmFzZUtleQ=="
 	metaFoo = &MetaSetItem{Key: key, Value: []byte("with_base64_key"), Flags: MetaSetFlags{IsKeyBase64: true}}
 	_, err = c.MetaSet(metaFoo)
-	checkErr(err, "fourth meta set(%s): %v", key, err)
+	checkErr(err, "ninth meta set(%s): %v", key, err)
 }
 
 func stringSlicesEqual(a, b []byte) bool {

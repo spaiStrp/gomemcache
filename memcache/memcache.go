@@ -81,6 +81,7 @@ const (
 	NoReplySemanticsFlag      = "q"
 	UpdateTTLTokenMetaFlag    = "T"
 	ModeFlag                  = "M"
+	TTLResponseMetaFlag       = "t"
 )
 
 const buffered = 8 // arbitrary buffered channel size, for readability
@@ -123,6 +124,7 @@ var (
 	resultTouched   = []byte("TOUCHED\r\n")
 
 	resultClientErrorPrefix = []byte("CLIENT_ERROR ")
+	resultServerErrorPrefix = []byte("SERVER_ERROR ")
 	versionPrefix           = []byte("VERSION")
 
 	metaResultStored    = []byte("HD")
@@ -735,6 +737,14 @@ type MetaSetItem struct {
 	Value  []byte
 }
 
+type MetaResponseMetadata struct {
+	Value                 []byte
+	CasId                 *uint64
+	Key                   *string
+	OpaqueValue           *string
+	TTLRemainingInSeconds *int32
+}
+
 type MetaSetFlags struct {
 	// use if the key provided is base 64 encoded
 	// equivalent to the b flag
@@ -753,6 +763,8 @@ type MetaSetFlags struct {
 	// equivalent to the k flag
 	ReturnKeyInResponse bool
 
+	// use if you wish to reduce the amount of data being sent back by memcached
+	// note: this will always return an error for commands using this flag
 	// equivalent to the q flag
 	UseNoReplySemanticsForResponse bool
 
@@ -782,11 +794,12 @@ type MetaSetFlags struct {
 	SetModeToken *string
 }
 
-func (c *Client) MetaSet(metaItem *MetaSetItem) error {
-	return c.onMetaItem(metaItem, (*Client).metaSet)
+func (c *Client) MetaSet(metaItem *MetaSetItem) (metaDataResponse *MetaResponseMetadata, err error) {
+	err = c.onMetaItem(metaItem, (*Client).processMetaSet, func(metaData *MetaResponseMetadata) { metaDataResponse = metaData })
+	return
 }
 
-func (c *Client) onMetaItem(item *MetaSetItem, fn func(*Client, *bufio.ReadWriter, *MetaSetItem) error) error {
+func (c *Client) onMetaItem(item *MetaSetItem, fn func(*Client, *bufio.ReadWriter, *MetaSetItem, func(metaData *MetaResponseMetadata)) error, cb func(metaData *MetaResponseMetadata)) error {
 	addr, err := c.selector.PickServer(item.Key)
 	if err != nil {
 		return err
@@ -796,17 +809,13 @@ func (c *Client) onMetaItem(item *MetaSetItem, fn func(*Client, *bufio.ReadWrite
 		return err
 	}
 	defer cn.condRelease(&err)
-	if err = fn(c, cn.rw, item); err != nil {
+	if err = fn(c, cn.rw, item, cb); err != nil {
 		return err
 	}
 	return nil
 }
 
-func (c *Client) metaSet(rw *bufio.ReadWriter, item *MetaSetItem) error {
-	return c.processMetaSet(rw, item)
-}
-
-func (c *Client) processMetaSet(rw *bufio.ReadWriter, item *MetaSetItem) error {
+func (c *Client) processMetaSet(rw *bufio.ReadWriter, item *MetaSetItem, cb func(*MetaResponseMetadata)) error {
 	if !legalKey(item.Key) {
 		return ErrMalformedKey
 	}
@@ -828,21 +837,96 @@ func (c *Client) processMetaSet(rw *bufio.ReadWriter, item *MetaSetItem) error {
 	if err := rw.Flush(); err != nil {
 		return err
 	}
-	line, err := rw.ReadSlice('\n')
+	response, err := rw.ReadSlice('\n')
 	if err != nil {
 		return err
 	}
 	switch {
-	case bytes.HasPrefix(line, metaResultStored):
+	case bytes.HasPrefix(response, metaResultStored):
+		// the first two characters are being processed in this switch-case block, the other cases are all errors
+		// so we don't need to save them into the meta data object
+		responseMetadataComponents := strings.Fields(string(response))[1:]
+		var metaResponse *MetaResponseMetadata
+		if metaResponse, err = createMetaResponseMetadata(responseMetadataComponents); err != nil {
+			return err
+		}
+		cb(metaResponse)
 		return nil
-	case bytes.HasPrefix(line, metaResultNotStored):
+	case bytes.HasPrefix(response, metaResultNotStored):
 		return ErrNotStored
-	case bytes.HasPrefix(line, metaResultExists):
+	case bytes.HasPrefix(response, metaResultExists):
 		return ErrCASConflict
-	case bytes.HasPrefix(line, metaResultNotFound):
+	case bytes.HasPrefix(response, metaResultNotFound):
 		return ErrCacheMiss
 	}
-	return fmt.Errorf("memcache: unexpected response line from ms: %q", string(line))
+	return fmt.Errorf("memcache: unexpected response line from ms: %q", string(response))
+}
+
+func getMemCacheErrorFromResponse(response []byte) error {
+	switch {
+	case bytes.HasPrefix(response, resultClientErrorPrefix):
+		errMsg := response[len(resultClientErrorPrefix) : len(response)-2]
+		return errors.New("memcache: client error: " + string(errMsg))
+
+	case bytes.HasPrefix(response, resultServerErrorPrefix):
+		errMsg := response[len(resultServerErrorPrefix) : len(response)-2]
+		return errors.New("memcache: server error: " + string(errMsg))
+	}
+
+	return nil
+}
+
+//function reads the  response from meta commands and returns a struct MetaResponseMetadata
+//response of meta commands contain flags which are single characters.
+// For ex if MetaGetFlags.ReturnTTLRemainingSecondsInResponse is set to true then response
+//will contain t300. Here 300 is the amount of TTL remaining in Seconds
+func createMetaResponseMetadata(metaResponseMetadata []string) (*MetaResponseMetadata, error) {
+
+	if len(metaResponseMetadata) != 0 {
+		respMetadata := new(MetaResponseMetadata)
+
+		for _, metadata := range metaResponseMetadata {
+			if err := populateMetaResponseMetadata(metadata[0:1], metadata[1:], respMetadata); err != nil {
+				return nil, err
+			}
+		}
+
+		return respMetadata, nil
+	}
+
+	return nil, nil
+}
+
+//populates the MetaResponseMetadata based on the response flags
+func populateMetaResponseMetadata(respFlagKey string,
+	respValue string,
+	respMetadata *MetaResponseMetadata) error {
+
+	var err error
+
+	switch {
+	case respFlagKey == CasTokenResponseMetaFlag:
+		var casId uint64
+		if casId, err = strconv.ParseUint(respValue, 10, 64); err != nil {
+			return err
+		}
+		respMetadata.CasId = &casId
+	case respFlagKey == ReturnKeyAsTokenFlag:
+		key := respValue
+		respMetadata.Key = &key
+	case respFlagKey == OpaqueTokenFlag:
+		token := respValue
+		respMetadata.OpaqueValue = &token
+	case respFlagKey == TTLResponseMetaFlag:
+		var ttl int64
+		if ttl, err = strconv.ParseInt(respValue, 10, 32); err != nil {
+			return err
+		}
+		ttl32 := int32(ttl)
+		respMetadata.TTLRemainingInSeconds = &ttl32
+	}
+
+	return nil
 }
 
 func (c *Client) parseFlagsForMetaSet(metaItem *MetaSetItem) string {

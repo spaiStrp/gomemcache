@@ -71,11 +71,24 @@ const (
 	// kept for any single address.
 	DefaultMaxIdleConns = 2
 
-	Base64MetaFlag           = "b"
-	CasTokenResponseMetaFlag = "c"
-	ItemValueFlag            = "v"
-	TTLResponseMetaFlag      = "t"
-	UpdateTTLTokenMetaFlag   = "T"
+	//Meta commands flag constants
+	base64MetaFlag                        = "b"
+	casTokenResponseMetaFlag              = "c"
+	itemValueMetaFlag                     = "v"
+	ttlResponseMetaFlag                   = "t"
+	updateTTLTokenMetaFlag                = "T"
+	returnKeyAsTokenMetaFlag              = "k"
+	clientFlagsResponseMetaFlag           = "f"
+	itemHitResponseMetaFlag               = "h"
+	lastAccessTimeResponseMetaFlag        = "l"
+	itemSizeResponseMetaFlag              = "s"
+	opaqueTokenMetaFlag                   = "O"
+	reCacheWonResponseMetaFlag            = "W"
+	itemStaleResponseMetaFlag             = "X"
+	reCacheWonAlreadySentResponseMetaFlag = "Z"
+	vivifyOnMissTokenMetaFlag             = "N"
+	reCacheTTLTokenMetaFlag               = "R"
+	dontBumpItemInLruMetaFlag             = "u"
 )
 
 const buffered = 8 // arbitrary buffered channel size, for readability
@@ -119,6 +132,7 @@ var (
 
 	resultClientErrorPrefix = []byte("CLIENT_ERROR ")
 	resultServerErrorPrefix = []byte("SERVER_ERROR ")
+	resultErrorPrefix       = []byte("ERROR")
 	versionPrefix           = []byte("VERSION")
 	metaGetMissPrefix       = []byte("EN")
 	metaGetValuePrefix      = []byte("VA")
@@ -219,22 +233,32 @@ type MetaGetFlags struct {
 	//Set this to true to access an item without causing it to be "bumped" to the head
 	//of the LRU. This also avoids marking an item as being hit or updating its last
 	//access time.
+	//Same as Meta Get -u option
 	DontBumpItemInLRU bool
 
 	//opaque value, consumes a token and copies back with response
 	//Same as Meta Get -O option
 	OpaqueToken *string
 
-	//If supplied, and metaget does not find the item in cache, it will
+	//If supplied, and meta get does not find the item in cache, it will
 	//create a stub item with the key and TTL as supplied.
-	//todo update this
+	//If such an item is created a 	IsReCacheWonFlagSet in MetaResponseMetadata will be set to true
+	//to indicate to a client that they have "won" the right to re cache an item.
+	//The automatically created item has 0 bytes of data.
+	//Further, requests will see a IsReCacheWonFlagAlreadySent set to true in MetaResponseMetadata
+	//to indicate that another client has already received the win flag.
 	//Same as Meta Get -N option
 	VivifyTTLToken *int32
 
-	//todo add comment
+	//If the remaining TTL of an item is
+	//below the supplied token, IsReCacheWonFlagSet in MetaResponseMetadata will be set to true
+	//to indicate the client has "won" the right to re cache an item. This allows refreshing an item before it leads to
+	//a miss.
+	//Same as Meta Get -R option
 	ReCacheTTLToken *int32
 
-	//todo add comment
+	//updates the remaining TTL of an item if hit.
+	//Same as Meta Get -R option
 	UpdateTTLToken *int32
 }
 
@@ -242,16 +266,34 @@ type MetaGetFlags struct {
 //Some of these values can be nil if the corresponding meta flag is not set while calling
 //meta functions
 type MetaResponseMetadata struct {
-	//todo add comments
-	CasId                 *uint64
-	TTLRemainingInSeconds *int32
-}
 
-//MetaGetResponse holds the response of MetaGet command
-type MetaGetResponse struct {
-	//todo add comments
-	Value            []byte
-	responseMetadata MetaResponseMetadata
+	//Cache value. This will be always present for Meta get command
+	Value []byte
+	//Compare and set token
+	CasId *uint64
+	//TTL remaining in seconds for the value. -1 means unlimited
+	TTLRemainingInSeconds *int32
+	//Cache key
+	ItemKey *string
+	//Client flags
+	ClientFlag *uint32
+	//Will be true if an item has been hit before
+	isItemHitBefore *bool
+	//Cache value size in bytes
+	ItemSizeInBytes *uint64
+	//Time since item was last accessed in seconds
+	TimeInSecondsSinceLastAccessed *uint32
+	//Opaque token
+	OpaqueToken *string
+	//Will be true if client has won the re cache
+	//same as -W flag from mem cache
+	IsReCacheWonFlagSet *bool
+	//if this is true then it indicates that a different client
+	//is responsible for re caching this item
+	IsReCacheWonFlagAlreadySent *bool
+	//Will be true if the item is stale
+
+	isItemStale *bool
 }
 
 // conn is a connection to a server.
@@ -572,17 +614,17 @@ func (c *Client) GetMulti(keys []string) (map[string]*Item, error) {
 //which supports additional functionality.
 //ErrCacheMiss is returned if a key is not found
 //The key must be at most 250 bytes in length.
-func (c *Client) MetaGet(key string, metaGetFlags *MetaGetFlags) (metaGetResponse *MetaGetResponse, err error) {
+func (c *Client) MetaGet(key string, metaGetFlags *MetaGetFlags) (metaResponseMetadata *MetaResponseMetadata, err error) {
 	err = c.withKeyAddr(key, func(addr net.Addr) error {
 		return c.metaGetFromAddr(addr,
 			key,
 			metaGetFlags,
-			func(metaGetRes *MetaGetResponse) { metaGetResponse = metaGetRes })
+			func(metaGetRes *MetaResponseMetadata) { metaResponseMetadata = metaGetRes })
 	})
 	return
 }
 
-func (c *Client) metaGetFromAddr(addr net.Addr, key string, metaGetFlags *MetaGetFlags, cb func(response *MetaGetResponse)) error {
+func (c *Client) metaGetFromAddr(addr net.Addr, key string, metaGetFlags *MetaGetFlags, cb func(response *MetaResponseMetadata)) error {
 
 	return c.withAddrRw(addr, func(rw *bufio.ReadWriter) error {
 		metaGetCommandFlags := createMetaGetFlagCommands(metaGetFlags)
@@ -603,7 +645,7 @@ func (c *Client) metaGetFromAddr(addr net.Addr, key string, metaGetFlags *MetaGe
 }
 
 //function parses meta get response
-func parseMetaGetResponse(r *bufio.Reader, cb func(*MetaGetResponse)) error {
+func parseMetaGetResponse(r *bufio.Reader, cb func(metadata *MetaResponseMetadata)) error {
 
 	response, err := r.ReadSlice('\n')
 	if err != nil {
@@ -636,36 +678,32 @@ func parseMetaGetResponse(r *bufio.Reader, cb func(*MetaGetResponse)) error {
 		return err
 	}
 
-	metaGetResponse := new(MetaGetResponse)
-	metaGetResponse.Value = make([]byte, size+2)
+	metaRespMetadata := new(MetaResponseMetadata)
+	metaRespMetadata.Value = make([]byte, size+2)
 
 	//populate value
-	_, err = io.ReadFull(r, metaGetResponse.Value)
+	_, err = io.ReadFull(r, metaRespMetadata.Value)
 
 	if err != nil {
-		metaGetResponse.Value = nil
+		metaRespMetadata.Value = nil
 		return err
 	}
 
 	//check if value has a suffix of clrf (i.e. \r\n)
-	if !bytes.HasSuffix(metaGetResponse.Value, crlf) {
-		metaGetResponse.Value = nil
+	if !bytes.HasSuffix(metaRespMetadata.Value, crlf) {
+		metaRespMetadata.Value = nil
 		return fmt.Errorf("memcache: corrupt meta get result read")
 	}
 
-	var metaRespMetadata *MetaResponseMetadata
-	metaGetResponse.Value = metaGetResponse.Value[:size]
+	metaRespMetadata.Value = metaRespMetadata.Value[:size]
 
 	responseMetadata := responseComponents[2:]
 
-	if metaRespMetadata, err = createMetaResponseMetadata(responseMetadata); err != nil {
+	if err = parseMetaResponseMetadata(responseMetadata, metaRespMetadata); err != nil {
 		return err
 	}
 
-	if metaRespMetadata != nil {
-		metaGetResponse.responseMetadata = *metaRespMetadata
-	}
-	cb(metaGetResponse)
+	cb(metaRespMetadata)
 
 	return nil
 }
@@ -674,39 +712,37 @@ func parseMetaGetResponse(r *bufio.Reader, cb func(*MetaGetResponse)) error {
 //response of meta commands contain flags which are single characters.
 // For ex if MetaGetFlags.ReturnTTLRemainingSecondsInResponse is set to true then response
 //will contain t300. Here 300 is the amount of TTL remaining in Seconds
-func createMetaResponseMetadata(metaResponseMetadata []string) (*MetaResponseMetadata, error) {
+func parseMetaResponseMetadata(metaResponseMetadata []string, metaRespMetadata *MetaResponseMetadata) error {
 
 	if len(metaResponseMetadata) != 0 {
-		respMetadata := new(MetaResponseMetadata)
-
 		for _, metadata := range metaResponseMetadata {
-			if err := populateMetaResponseMetadata(metadata[0:1], metadata[1:], respMetadata); err != nil {
-				return nil, err
+			if err := populateMetaResponseMetadata(metadata, metaRespMetadata); err != nil {
+				return err
 			}
 		}
-
-		return respMetadata, nil
+		return nil
 	}
 
-	return nil, nil
+	return nil
 }
 
 //populates the MetaResponseMetadata based on the response flags
-func populateMetaResponseMetadata(respFlagKey string,
-	respValue string,
-	respMetadata *MetaResponseMetadata) error {
+func populateMetaResponseMetadata(metadata string, respMetadata *MetaResponseMetadata) error {
 
 	var err error
+
+	respFlagKey := metadata[0:1]
+	respValue := metadata[1:]
 	switch {
 
-	case respFlagKey == CasTokenResponseMetaFlag:
+	case respFlagKey == casTokenResponseMetaFlag:
 		var casId uint64
 		if casId, err = strconv.ParseUint(respValue, 10, 64); err != nil {
 			return err
 		}
 		respMetadata.CasId = &casId
 
-	case respFlagKey == TTLResponseMetaFlag:
+	case respFlagKey == ttlResponseMetaFlag:
 		var ttl int64
 
 		if ttl, err = strconv.ParseInt(respValue, 10, 32); err != nil {
@@ -714,17 +750,77 @@ func populateMetaResponseMetadata(respFlagKey string,
 		}
 		ttl32 := int32(ttl)
 		respMetadata.TTLRemainingInSeconds = &ttl32
+
+	case respFlagKey == returnKeyAsTokenMetaFlag:
+		respMetadata.ItemKey = &respValue
+
+	case respFlagKey == clientFlagsResponseMetaFlag:
+		var flag *uint32
+		if flag, err = convertToUInt32(respValue); err != nil {
+			return err
+		}
+		respMetadata.ClientFlag = flag
+
+	case respFlagKey == itemHitResponseMetaFlag:
+		hitValue := true
+		if respValue == "0" {
+			hitValue = false
+		}
+		respMetadata.isItemHitBefore = &hitValue
+
+	case respFlagKey == itemSizeResponseMetaFlag:
+		var size uint64
+		if size, err = strconv.ParseUint(respValue, 10, 64); err != nil {
+			return err
+		}
+		respMetadata.ItemSizeInBytes = &size
+
+	case respFlagKey == lastAccessTimeResponseMetaFlag:
+		var lastAccessTime *uint32
+		if lastAccessTime, err = convertToUInt32(respValue); err != nil {
+			return err
+		}
+		respMetadata.TimeInSecondsSinceLastAccessed = lastAccessTime
+
+	case respFlagKey == opaqueTokenMetaFlag:
+		respMetadata.OpaqueToken = &respValue
+
+	case respFlagKey == reCacheWonResponseMetaFlag:
+		reCacheWonFlag := true
+		respMetadata.IsReCacheWonFlagSet = &reCacheWonFlag
+
+	case respFlagKey == itemStaleResponseMetaFlag:
+		itemStaleFlag := true
+		respMetadata.isItemStale = &itemStaleFlag
+
+	case respFlagKey == reCacheWonAlreadySentResponseMetaFlag:
+		reCacheWonFlagAlreadySent := true
+		respMetadata.IsReCacheWonFlagAlreadySent = &reCacheWonFlagAlreadySent
+
 	}
 
 	return nil
 }
 
+func convertToUInt32(num string) (*uint32, error) {
+
+	var err error
+	var uInt64Num uint64
+	var uInt32Num uint32
+	if uInt64Num, err = strconv.ParseUint(num, 10, 32); err != nil {
+		return nil, err
+	}
+	uInt32Num = uint32(uInt64Num)
+	return &uInt32Num, nil
+}
+
 func getMemCacheErrorFromResponse(response []byte) error {
 	switch {
+	case bytes.HasPrefix(response, resultErrorPrefix):
+		return errors.New("memcache: unrecognized command name.")
 	case bytes.HasPrefix(response, resultClientErrorPrefix):
 		errMsg := response[len(resultClientErrorPrefix) : len(response)-2]
 		return errors.New("memcache: client error: " + string(errMsg))
-
 	case bytes.HasPrefix(response, resultServerErrorPrefix):
 		errMsg := response[len(resultServerErrorPrefix) : len(response)-2]
 		return errors.New("memcache: server error: " + string(errMsg))
@@ -736,26 +832,69 @@ func getMemCacheErrorFromResponse(response []byte) error {
 //creates the necessary meta get flag commands from the MetaGetFlags struct
 func createMetaGetFlagCommands(metaFlags *MetaGetFlags) string {
 
-	metaFlagCommands := []string{ItemValueFlag}
+	var metaFlagCommands strings.Builder
 
-	if metaFlags.UpdateTTLToken != nil {
-		updateTTLTokenFlag := UpdateTTLTokenMetaFlag + strconv.FormatInt(int64(*metaFlags.UpdateTTLToken), 10)
-		metaFlagCommands = append(metaFlagCommands, updateTTLTokenFlag)
+	metaFlagCommands.WriteString(itemValueMetaFlag + " ")
+
+	if metaFlags != nil {
+		if metaFlags.UpdateTTLToken != nil {
+			updateTTLTokenFlag := updateTTLTokenMetaFlag + strconv.FormatInt(int64(*metaFlags.UpdateTTLToken), 10)
+			metaFlagCommands.WriteString(updateTTLTokenFlag + " ")
+		}
+
+		if metaFlags.IsKeyBase64 {
+			metaFlagCommands.WriteString(base64MetaFlag + " ")
+		}
+
+		if metaFlags.ReturnCasTokenInResponse {
+			metaFlagCommands.WriteString(casTokenResponseMetaFlag + " ")
+		}
+
+		if metaFlags.ReturnTTLRemainingSecondsInResponse {
+			metaFlagCommands.WriteString(ttlResponseMetaFlag + " ")
+		}
+
+		if metaFlags.ReturnKeyInResponse {
+			metaFlagCommands.WriteString(returnKeyAsTokenMetaFlag + " ")
+		}
+
+		if metaFlags.ReturnClientFlagsInResponse {
+			metaFlagCommands.WriteString(clientFlagsResponseMetaFlag + " ")
+		}
+
+		if metaFlags.ReturnItemHitInResponse {
+			metaFlagCommands.WriteString(itemHitResponseMetaFlag + " ")
+		}
+
+		if metaFlags.ReturnItemSizeBytesInResponse {
+			metaFlagCommands.WriteString(itemSizeResponseMetaFlag + " ")
+		}
+
+		if metaFlags.ReturnLastAccessedTimeSecondsInResponse {
+			metaFlagCommands.WriteString(lastAccessTimeResponseMetaFlag + " ")
+		}
+
+		if metaFlags.OpaqueToken != nil {
+			opaqueToken := opaqueTokenMetaFlag + *metaFlags.OpaqueToken
+			metaFlagCommands.WriteString(opaqueToken + " ")
+		}
+
+		if metaFlags.VivifyTTLToken != nil {
+			vivifyToken := vivifyOnMissTokenMetaFlag + strconv.FormatInt(int64(*metaFlags.VivifyTTLToken), 10)
+			metaFlagCommands.WriteString(vivifyToken + " ")
+		}
+
+		if metaFlags.ReCacheTTLToken != nil {
+			reCacheTTLToken := reCacheTTLTokenMetaFlag + strconv.FormatInt(int64(*metaFlags.ReCacheTTLToken), 10)
+			metaFlagCommands.WriteString(reCacheTTLToken + " ")
+		}
+
+		if metaFlags.DontBumpItemInLRU {
+			metaFlagCommands.WriteString(dontBumpItemInLruMetaFlag + " ")
+		}
 	}
 
-	if metaFlags.IsKeyBase64 {
-		metaFlagCommands = append(metaFlagCommands, Base64MetaFlag)
-	}
-
-	if metaFlags.ReturnCasTokenInResponse {
-		metaFlagCommands = append(metaFlagCommands, CasTokenResponseMetaFlag)
-	}
-
-	if metaFlags.ReturnTTLRemainingSecondsInResponse {
-		metaFlagCommands = append(metaFlagCommands, TTLResponseMetaFlag)
-	}
-
-	return strings.Join(metaFlagCommands, " ")
+	return strings.TrimSuffix(metaFlagCommands.String(), " ")
 }
 
 // parseGetResponse reads a GET response from r and calls cb for each

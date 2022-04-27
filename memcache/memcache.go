@@ -290,9 +290,10 @@ type MetaResponseMetadata struct {
 	IsReCacheWonFlagSet *bool
 	//if this is true then it indicates that a different client
 	//is responsible for re caching this item
+	//same as -Z flag from memcache
 	IsReCacheWonFlagAlreadySent *bool
 	//Will be true if the item is stale
-
+	//same as -X flag from memcache
 	isItemStale *bool
 }
 

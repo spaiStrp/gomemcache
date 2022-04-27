@@ -141,6 +141,7 @@ var (
 	metaResultNotStored = []byte("NS")
 	metaResultExists    = []byte("EX")
 	metaResultNotFound  = []byte("NF")
+	metaResultDeleted   = []byte("HD")
 )
 
 // New returns a memcache client using the provided server(s)
@@ -746,6 +747,11 @@ type MetaSetItem struct {
 	Value []byte
 }
 
+type MetaDeleteItem struct {
+	Key   string
+	Flags MetaDeleteFlags
+}
+
 type MetaResponseMetadata struct {
 	Value                 []byte
 	CasId                 *uint64
@@ -803,8 +809,47 @@ type MetaSetFlags struct {
 	UpdateTTLToken *int32
 }
 
+type MetaDeleteFlags struct {
+	// use if the key provided is base 64 encoded
+	// equivalent to the b flag
+	IsKeyBase64 bool
+
+	// use if you provide a cas token with CompareCasTokenToUpdateValue attribute and it is older than the item's CAS
+	// note: only functional when combined with the CompareCasTokenToUpdateValue attribute
+	// equivalent to the I flag
+	Invalidate bool
+
+	// use if you want to get the key as a part of the response
+	// equivalent to the k flag
+	ReturnKeyInResponse bool
+
+	// use if you wish to reduce the amount of data being sent back by memcached
+	// note: this will always return an error for commands using this flag
+	// equivalent to the q flag
+	UseNoReplySemanticsForResponse bool
+
+	// use if only want to store a value if the supplied token matches the current CAS token of the item
+	// equivalent to the C<token> flag
+	CompareCasTokenToUpdateValue *uint64
+
+	// use if you want to consume a token and copy back with a response
+	// equivalent to the O<token> flag
+	OpaqueToken *string
+
+	// use if you want to set the TTL for the item
+	// equivalent to the T<token> flag
+	UpdateTTLToken *int32
+}
+
 func (c *Client) MetaSet(metaItem *MetaSetItem) (metaDataResponse *MetaResponseMetadata, err error) {
 	err = c.onMetaItem(metaItem, (*Client).processMetaSet, func(metaData *MetaResponseMetadata) { metaDataResponse = metaData })
+	return
+}
+
+func (c *Client) MetaDelete(metaItem *MetaDeleteItem) (metaDataResponse *MetaResponseMetadata, err error) {
+	err = c.withKeyRw(metaItem.Key, func(rw *bufio.ReadWriter) error {
+		return c.processMetaDelete(rw, c.parseFlagsForMetaDelete(metaItem), func(metaData *MetaResponseMetadata) { metaDataResponse = metaData })
+	})
 	return
 }
 
@@ -866,6 +911,27 @@ func (c *Client) processMetaSet(rw *bufio.ReadWriter, item *MetaSetItem, cb func
 		return ErrCacheMiss
 	}
 	return fmt.Errorf("memcache: unexpected response line from ms: %q", string(response))
+}
+
+func (c *Client) processMetaDelete(rw *bufio.ReadWriter, command string, cb func(*MetaResponseMetadata)) error {
+	response, err := writeReadLine(rw, command)
+	if err != nil {
+		return err
+	}
+	switch {
+	case bytes.HasPrefix(response, metaResultDeleted):
+		metaResponseMetadata := new(MetaResponseMetadata)
+		if err = parseMetaResponseMetadata(response, metaResponseMetadata); err != nil {
+			return err
+		}
+		cb(metaResponseMetadata)
+		return nil
+	case bytes.HasPrefix(response, metaResultNotFound):
+		return ErrCacheMiss
+	case bytes.HasPrefix(response, metaResultExists):
+		return ErrCASConflict
+	}
+	return fmt.Errorf("memcache: unexpected response line from md: %q", string(response))
 }
 
 func getMemCacheErrorFromResponse(response []byte) error {
@@ -971,6 +1037,36 @@ func (c *Client) parseFlagsForMetaSet(metaItem *MetaSetItem) string {
 		commandBuilder.WriteString(fmt.Sprintf(" %s%s", modeTokenMetaFlag, itemFlags.SetModeToken))
 	}
 	commandBuilder.WriteString("\r\n")
+
+	return commandBuilder.String()
+}
+
+func (c *Client) parseFlagsForMetaDelete(metaItem *MetaDeleteItem) string {
+	var commandBuilder strings.Builder
+	commandBuilder.WriteString(fmt.Sprintf("md %s", metaItem.Key))
+
+	itemFlags := metaItem.Flags
+	if itemFlags.IsKeyBase64 {
+		commandBuilder.WriteString(fmt.Sprintf(" %s", base64MetaFlag))
+	}
+	if itemFlags.Invalidate {
+		commandBuilder.WriteString(fmt.Sprintf(" %s", invalidateMetaFlag))
+	}
+	if itemFlags.ReturnKeyInResponse {
+		commandBuilder.WriteString(fmt.Sprintf(" %s", returnKeyAsTokenMetaFlag))
+	}
+	if itemFlags.UseNoReplySemanticsForResponse {
+		commandBuilder.WriteString(fmt.Sprintf(" %s", noReplySemanticsMetaFlag))
+	}
+	if itemFlags.CompareCasTokenToUpdateValue != nil {
+		commandBuilder.WriteString(fmt.Sprintf(" %s%d", compareCasValueTokenMetaFlag, *itemFlags.CompareCasTokenToUpdateValue))
+	}
+	if itemFlags.OpaqueToken != nil {
+		commandBuilder.WriteString(fmt.Sprintf(" %s%s", opaqueTokenMetaFlag, *itemFlags.OpaqueToken))
+	}
+	if itemFlags.UpdateTTLToken != nil {
+		commandBuilder.WriteString(fmt.Sprintf(" %s%d", updateTTLTokenMetaFlag, *itemFlags.UpdateTTLToken))
+	}
 
 	return commandBuilder.String()
 }

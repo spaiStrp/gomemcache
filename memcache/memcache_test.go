@@ -87,6 +87,9 @@ func testWithClient(t *testing.T, c *Client) {
 	}
 	mustSet := mustSetF(t, c)
 
+	// test meta commands
+	testMetaCommandsWithClient(t, c, checkErr)
+
 	// Set
 	foo := &Item{Key: "foo", Value: []byte("fooval"), Flags: 123}
 	err := c.Set(foo)
@@ -259,6 +262,58 @@ func testTouchWithClient(t *testing.T, c *Client) {
 			t.Fatalf("unexpected error retrieving bar: %v", err.Error())
 		}
 	}
+}
+
+func testMetaCommandsWithClient(t *testing.T, c *Client, checkErr func(err error, format string, args ...interface{})) {
+	// Meta Set
+	key := "bah"
+	opaqueToken := "A123"
+	metaFoo := &MetaSetItem{Key: key, Value: []byte("bahval"), Flags: MetaSetFlags{ReturnKeyInResponse: true, ReturnCasTokenInResponse: true, OpaqueToken: &opaqueToken}}
+	response, err := c.MetaSet(metaFoo)
+	if *response.Key != key {
+		t.Errorf("meta set(%s) Key = %q, want %s", key, *response.Key, key)
+	}
+	if *response.OpaqueValue != opaqueToken {
+		t.Errorf("meta set(%s) Opaque token = %s, want %s", key, *response.Key, opaqueToken)
+	}
+	casToken := response.CasId
+	if casToken == nil {
+		t.Errorf("meta set(%s) error, no CAS token returned", key)
+	}
+	checkErr(err, "first meta set(%s): %v", key, err)
+
+	// set using the same cas token as what was last set
+	var newTTL uint32 = 900000
+	var clientFlagToken uint32 = 90
+	metaFoo = &MetaSetItem{Key: key, Value: []byte("new_bah_val"), Flags: MetaSetFlags{CompareCasTokenToUpdateValue: *&casToken, ClientFlagToken: &clientFlagToken, UpdateTTLToken: &newTTL}}
+	response, err = c.MetaSet(metaFoo)
+	checkErr(err, "second meta set(%s): %v", key, err)
+
+	// set with no reply semantics turned on
+	// note that the documentation says that this flag will always return an error (even if the command runs successfully)
+	metaFoo = &MetaSetItem{Key: key, Value: []byte("with_base64_key"), Flags: MetaSetFlags{UseNoReplySemanticsForResponse: true}}
+	_, err = c.MetaSet(metaFoo)
+	if err == nil {
+		t.Errorf("third meta set(%s) expected an error to be returned but got none", key)
+	}
+
+	// set using base64 encoded string (non-encoded is newBaseKey)
+	key = "bmV3QmFzZUtleQ=="
+	metaFoo = &MetaSetItem{Key: key, Value: []byte("with_base64_key"), Flags: MetaSetFlags{IsKeyBase64: true}}
+	_, err = c.MetaSet(metaFoo)
+	checkErr(err, "fourth meta set(%s): %v", key, err)
+}
+
+func stringSlicesEqual(a, b []byte) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i, v := range a {
+		if v != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func BenchmarkOnItem(b *testing.B) {

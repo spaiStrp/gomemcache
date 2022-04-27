@@ -852,8 +852,11 @@ func (c *Client) processMetaSet(rw *bufio.ReadWriter, item *MetaSetItem, cb func
 	}
 	switch {
 	case bytes.HasPrefix(response, metaResultStored):
+		// the first two characters are being processed in this switch-case block, the other cases are all errors
+		// so we don't need to save them into the meta data object
+		responseMetadataComponents := strings.Fields(string(response))[1:]
 		metaResponseMetadata := new(MetaResponseMetadata)
-		if err = parseMetaResponseMetadata(response, metaResponseMetadata); err != nil {
+		if err = parseMetaResponseMetadata(responseMetadataComponents, metaResponseMetadata); err != nil {
 			return err
 		}
 		cb(metaResponseMetadata)
@@ -868,28 +871,11 @@ func (c *Client) processMetaSet(rw *bufio.ReadWriter, item *MetaSetItem, cb func
 	return fmt.Errorf("memcache: unexpected response line from ms: %q", string(response))
 }
 
-func getMemCacheErrorFromResponse(response []byte) error {
-	switch {
-	case bytes.HasPrefix(response, resultClientErrorPrefix):
-		errMsg := response[len(resultClientErrorPrefix) : len(response)-2]
-		return errors.New("memcache: client error: " + string(errMsg))
-
-	case bytes.HasPrefix(response, resultServerErrorPrefix):
-		errMsg := response[len(resultServerErrorPrefix) : len(response)-2]
-		return errors.New("memcache: server error: " + string(errMsg))
-	}
-
-	return nil
-}
-
 //function reads the  response from meta commands and returns a struct MetaResponseMetadata
 //response of meta commands contain flags which are single characters.
 // For ex if MetaGetFlags.ReturnTTLRemainingSecondsInResponse is set to true then response
 //will contain t300. Here 300 is the amount of TTL remaining in Seconds
-func parseMetaResponseMetadata(response []byte, respMetadata *MetaResponseMetadata) error {
-	// the first two characters are being processed in this switch-case block, the other cases are all errors
-	// so we don't need to save them into the meta data object
-	metaResponseMetadata := strings.Fields(string(response))[1:]
+func parseMetaResponseMetadata(metaResponseMetadata []string, respMetadata *MetaResponseMetadata) error {
 	if len(metaResponseMetadata) != 0 {
 		for _, metadata := range metaResponseMetadata {
 			if err := populateMetaResponseMetadata(metadata[0:1], metadata[1:], respMetadata); err != nil {

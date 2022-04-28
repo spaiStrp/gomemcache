@@ -900,7 +900,7 @@ func (c *Client) processMetaSet(rw *bufio.ReadWriter, item *MetaSetItem, cb func
 func parseMetaResponseMetadata(metaResponseMetadata []string, respMetadata *MetaResponseMetadata) error {
 	if len(metaResponseMetadata) != 0 {
 		for _, metadata := range metaResponseMetadata {
-			if err := populateMetaResponseMetadata(metadata[0:1], metadata[1:], respMetadata); err != nil {
+			if err := populateMetaResponseMetadata(metadata, respMetadata); err != nil {
 				return err
 			}
 		}
@@ -912,11 +912,10 @@ func parseMetaResponseMetadata(metaResponseMetadata []string, respMetadata *Meta
 }
 
 //populates the MetaResponseMetadata based on the response flags
-func populateMetaResponseMetadata(respFlagKey string,
-	respValue string,
-	respMetadata *MetaResponseMetadata) error {
-
+func populateMetaResponseMetadata(metadata string, respMetadata *MetaResponseMetadata) error {
 	var err error
+	respFlagKey := metadata[0:1]
+	respValue := metadata[1:]
 
 	switch {
 	case respFlagKey == casTokenResponseMetaFlag:

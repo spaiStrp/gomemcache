@@ -275,7 +275,7 @@ func testMetaSetCommandsWithClient(t *testing.T, c *Client, checkErr func(err er
 		t.Errorf("meta set(%s) Key = %q, want %s", key, *response.ItemKey, key)
 	}
 	if *response.OpaqueToken != opaqueToken {
-		t.Errorf("meta set(%s) Opaque token = %s, want %s", key, *response.ItemKey, opaqueToken)
+		t.Errorf("meta set(%s) Opaque token = %s, want %s", key, *response.OpaqueToken, opaqueToken)
 	}
 	casToken := response.CasId
 	if casToken == nil {

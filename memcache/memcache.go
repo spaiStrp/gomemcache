@@ -814,8 +814,8 @@ type MetaDeleteFlags struct {
 	// equivalent to the b flag
 	IsKeyBase64 bool
 
-	// use if you provide a cas token with CompareCasTokenToUpdateValue attribute and it is older than the item's CAS
-	// note: only functional when combined with the CompareCasTokenToUpdateValue attribute
+	// instead of removing an item, it will give the item a new CAS value and mark it as stale so the next metaget
+	//   will be supplied an 'X' flag to show that the data is stale and needs to be recached
 	// equivalent to the I flag
 	Invalidate bool
 
@@ -837,6 +837,7 @@ type MetaDeleteFlags struct {
 	OpaqueToken *string
 
 	// use if you want to set the TTL for the item
+	// note: only works when paired with the Invalidate attribute
 	// equivalent to the T<token> flag
 	UpdateTTLToken *int32
 }
@@ -1067,6 +1068,7 @@ func (c *Client) parseFlagsForMetaDelete(metaItem *MetaDeleteItem) string {
 	if itemFlags.UpdateTTLToken != nil {
 		commandBuilder.WriteString(fmt.Sprintf(" %s%d", updateTTLTokenMetaFlag, *itemFlags.UpdateTTLToken))
 	}
+	commandBuilder.WriteString("\r\n")
 
 	return commandBuilder.String()
 }

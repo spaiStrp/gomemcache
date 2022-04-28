@@ -88,7 +88,8 @@ func testWithClient(t *testing.T, c *Client) {
 	mustSet := mustSetF(t, c)
 
 	// test meta commands
-	testMetaCommandsWithClient(t, c, checkErr)
+	// testMetaCommandsWithClient(t, c, checkErr)
+	testMetaDeleteCommandsWithClient(t, c, checkErr)
 
 	// Set
 	foo := &Item{Key: "foo", Value: []byte("fooval"), Flags: 123}
@@ -331,6 +332,77 @@ func testMetaCommandsWithClient(t *testing.T, c *Client, checkErr func(err error
 	metaFoo = &MetaSetItem{Key: key, Value: []byte("with_base64_key"), Flags: MetaSetFlags{IsKeyBase64: true}}
 	_, err = c.MetaSet(metaFoo)
 	checkErr(err, "ninth meta set(%s): %v", key, err)
+}
+
+func testMetaDeleteCommandsWithClient(t *testing.T, c *Client, checkErr func(err error, format string, args ...interface{})) {
+	setForDelete := func(key string, value []byte, flags MetaSetFlags) (metaDataResponse *MetaResponseMetadata, err error) {
+		metaSetItem := &MetaSetItem{Key: key, Value: value, Flags: MetaSetFlags{ReturnCasTokenInResponse: true}}
+		return c.MetaSet(metaSetItem)
+	}
+
+	key := "foo_key"
+	value := []byte("foo_val")
+	set_response, err := setForDelete(key, value, MetaSetFlags{ReturnCasTokenInResponse: true})
+	casValue := set_response.CasId
+
+	// normal delete with key return and opaque token provided on matching CAS token
+	opaqueToken := "opaque_token"
+	metaDeleteItem := &MetaDeleteItem{Key: key, Flags: MetaDeleteFlags{ReturnKeyInResponse: true, OpaqueToken: &opaqueToken, CompareCasTokenToUpdateValue: casValue}}
+	response, err := c.MetaDelete(metaDeleteItem)
+	if *response.Key != key {
+		t.Errorf("meta delete(%s) Key = %q, want %s", key, *response.Key, key)
+	}
+	if *response.OpaqueValue != opaqueToken {
+		t.Errorf("meta delete(%s) Opaque token = %s, want %s", key, *response.OpaqueValue, opaqueToken)
+	}
+	checkErr(err, "normal meta delete(%s): %v", key, err)
+
+	// failed delete due to mismatched CAS token
+	var mismatchCasToken uint64 = 123456
+	set_response, err = setForDelete(key, value, MetaSetFlags{})
+	metaDeleteItem = &MetaDeleteItem{Key: key, Flags: MetaDeleteFlags{ReturnKeyInResponse: true, OpaqueToken: &opaqueToken, CompareCasTokenToUpdateValue: &mismatchCasToken}}
+	_, err = c.MetaDelete(metaDeleteItem)
+	if err != ErrCASConflict {
+		t.Errorf("Different CAS token meta delete(%s) expected an CAS conflict error but got %e", key, err)
+	}
+
+	// TODO: requires meta get to retrieve the cas token of the set value and TTL after doing an invalidation delete
+	// delete with invalidation and TTL update- expect to see a new CAS token and TTL set
+	// set_response, err = setForDelete(key, value, MetaSetFlags{})
+	// casValue = set_response.CasId
+	// var newTTL int32 = 5000
+	// metaDeleteItem = &MetaDeleteItem{Key: key, Flags: MetaDeleteFlags{Invalidate: true, UpdateTTLToken: &newTTL}}
+	// response, err = c.MetaDelete(metaDeleteItem)
+	// if response.CasId == nil || casValue == response.CasId {
+	// 	t.Errorf("Invalidate meta delete(%s) expected CAS tokens to differ but were the same", key)
+	// }
+	// if response.TTLRemainingInSeconds == nil || response.TTLRemainingInSeconds != &newTTL {
+	// 	t.Errorf("meta delete(%s) TTLRemainingInSeconds should be non-nil and equal to %d", key, newTTL)
+	// }
+
+	// delete with no-reply semantics
+	// note that the documentation says that this flag will always return an error (even if the command runs successfully)
+	set_response, err = setForDelete(key, value, MetaSetFlags{})
+	metaDeleteItem = &MetaDeleteItem{Key: key, Flags: MetaDeleteFlags{ReturnKeyInResponse: true, UseNoReplySemanticsForResponse: true}}
+	_, err = c.MetaDelete(metaDeleteItem)
+	// the error raised is an internal error, so we can't check for explicit type
+	if err == nil {
+		t.Errorf("no reply meta delete(%s) expected an error to be returned but got none", key)
+	}
+
+	// delete with base-64 encoded key
+	// key = "bmV3QmFzZUtleQ=="
+	// decodedKey := "newBaseKey"
+	// set_response, err = setForDelete(key, value, MetaSetFlags{IsKeyBase64: true, ReturnKeyInResponse: true})
+	// metaDeleteItem = &MetaDeleteItem{Key: key, Flags: MetaDeleteFlags{IsKeyBase64: true, ReturnKeyInResponse: true}}
+	// response, err = c.MetaDelete(metaDeleteItem)
+	// if response.Key == nil {
+	// 	t.Errorf("base-64 encoded key meta delete(%s) expected decoded key to be %s but was nil", key, decodedKey)
+	// }
+	// if *response.Key != decodedKey {
+	// 	t.Errorf("base-64 encoded key meta delete(%s) expected decoded key to be %s but was %s", key, decodedKey, *response.Key)
+	// }
+	// checkErr(err, "base-64 encoded key meta delete(%s): %v", key, err)
 }
 
 func stringSlicesEqual(a, b []byte) bool {

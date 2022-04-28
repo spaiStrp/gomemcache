@@ -86,6 +86,14 @@ const (
 
 const buffered = 8 // arbitrary buffered channel size, for readability
 
+/*
+Enum meant to be used with the mode flag in the meta set command- these are
+currently the only supported modes by memcached and it forces the user to adhere
+to these modes specifically when using the mode flag.
+
+Description of what the different modes do can be found in the SetModeToken attribute
+of the MetaSetFlag struct.
+*/
 type MetaSetMode string
 
 const (
@@ -749,8 +757,8 @@ type MetaSetItem struct {
 type MetaResponseMetadata struct {
 	Value                 []byte
 	CasId                 *uint64
-	Key                   *string
-	OpaqueValue           *string
+	ItemKey               *string
+	OpaqueToken           *string
 	TTLRemainingInSeconds *int32
 }
 
@@ -803,6 +811,20 @@ type MetaSetFlags struct {
 	UpdateTTLToken *int32
 }
 
+/*
+This function provides functionality in Golang for the meta set command. The meta set command is a more flexible
+approach to setting values in memcached- instead of having multiple methods each do different things, you can consolidate
+everything you wish to do in one line with the meta command and its array of flags.
+
+Arguments
+@metaItem: encapsulates the key of the item, its new value, and all flags to apply to the meta set command
+
+Return values
+@metaDataResponse: encapsulates all values returned as a result of the flags which return a value applied to the meta set command
+@err: error that can be raised as a result of the operation- errors include: error because value wasn't stored, error because of cache miss,
+error because the item alerady exists (occurs with certain flags), I/O errors, malformed key error, and generic error for an unknown response
+from memcached
+*/
 func (c *Client) MetaSet(metaItem *MetaSetItem) (metaDataResponse *MetaResponseMetadata, err error) {
 	err = c.onMetaItem(metaItem, (*Client).processMetaSet, func(metaData *MetaResponseMetadata) { metaDataResponse = metaData })
 	return
@@ -905,10 +927,10 @@ func populateMetaResponseMetadata(respFlagKey string,
 		respMetadata.CasId = &casId
 	case respFlagKey == returnKeyAsTokenMetaFlag:
 		key := respValue
-		respMetadata.Key = &key
+		respMetadata.ItemKey = &key
 	case respFlagKey == opaqueTokenMetaFlag:
 		token := respValue
-		respMetadata.OpaqueValue = &token
+		respMetadata.OpaqueToken = &token
 	case respFlagKey == ttlResponseMetaFlag:
 		var ttl int64
 		if ttl, err = strconv.ParseInt(respValue, 10, 32); err != nil {

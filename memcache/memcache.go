@@ -70,9 +70,39 @@ const (
 	// DefaultMaxIdleConns is the default maximum number of idle connections
 	// kept for any single address.
 	DefaultMaxIdleConns = 2
+
+	base64MetaFlag                = "b"
+	casTokenResponseMetaFlag      = "c"
+	compareCasValueTokenMetaFlag  = "C"
+	setClientFlagsToTokenMetaFlag = "F"
+	invalidateMetaFlag            = "I"
+	returnKeyAsTokenMetaFlag      = "k"
+	opaqueTokenMetaFlag           = "O"
+	noReplySemanticsMetaFlag      = "q"
+	updateTTLTokenMetaFlag        = "T"
+	modeTokenMetaFlag             = "M"
+	ttlResponseMetaFlag           = "t"
 )
 
 const buffered = 8 // arbitrary buffered channel size, for readability
+
+/*
+Enum meant to be used with the mode flag in the meta set command- these are
+currently the only supported modes by memcached and it forces the user to adhere
+to these modes specifically when using the mode flag.
+
+Description of what the different modes do can be found in the SetModeToken attribute
+of the MetaSetFlag struct.
+*/
+type MetaSetMode string
+
+const (
+	Add     MetaSetMode = "E"
+	Append  MetaSetMode = "A"
+	Prepend MetaSetMode = "P"
+	Replace MetaSetMode = "R"
+	Set     MetaSetMode = "S"
+)
 
 // resumableError returns true if err is only a protocol-level cache error.
 // This is used to determine whether or not a server connection should
@@ -112,7 +142,13 @@ var (
 	resultTouched   = []byte("TOUCHED\r\n")
 
 	resultClientErrorPrefix = []byte("CLIENT_ERROR ")
+	resultServerErrorPrefix = []byte("SERVER_ERROR ")
 	versionPrefix           = []byte("VERSION")
+
+	metaResultStored    = []byte("HD")
+	metaResultNotStored = []byte("NS")
+	metaResultExists    = []byte("EX")
+	metaResultNotFound  = []byte("NF")
 )
 
 // New returns a memcache client using the provided server(s)
@@ -710,4 +746,238 @@ func (c *Client) incrDecr(verb, key string, delta uint64) (uint64, error) {
 		return nil
 	})
 	return val, err
+}
+
+type MetaSetItem struct {
+	Key   string
+	Flags MetaSetFlags
+	Value []byte
+}
+
+type MetaResponseMetadata struct {
+	ReturnItemValue       []byte
+	CasId                 *uint64
+	ItemKey               *string
+	OpaqueToken           *string
+	TTLRemainingInSeconds *int32
+}
+
+type MetaSetFlags struct {
+	// use if the key provided is base 64 encoded
+	// equivalent to the b flag
+	IsKeyBase64 bool
+
+	// use if you wish to see the cas token as a part of the response
+	// equivalent to the c flag
+	ReturnCasTokenInResponse bool
+
+	// use if you provide a cas token with CompareCasTokenToUpdateValue attribute and it is older than the item's CAS
+	// note: only functional when combined with the CompareCasTokenToUpdateValue attribute
+	// equivalent to the I flag
+	Invalidate bool
+
+	// use if you want to get the key as a part of the response
+	// equivalent to the k flag
+	ReturnKeyInResponse bool
+
+	// use if you wish to reduce the amount of data being sent back by memcached
+	// note: this will always return an error for commands using this flag
+	// equivalent to the q flag
+	UseNoReplySemanticsForResponse bool
+
+	// use if you want to switch modes
+	// E: "add" command. LRU bump and return NS if item exists, else add
+	// A: "append" command. If item exists, append the new value to its data
+	// P: "prepend" command. If item exists, prepend the new value to its data
+	// R: "replace" command. Set only if item exists, replace its value
+	// S: "set" command. The default mode, added for completeness
+	// equivalent to the M<token> flag
+	SetModeToken MetaSetMode
+
+	// use if only want to store a value if the supplied token matches the current CAS token of the item
+	// equivalent to the C<token> flag
+	CompareCasTokenToUpdateValue *uint64
+
+	// use if you want to set client flags to a token
+	// equivalent to the F<token> flag
+	ClientFlagToken *uint32
+
+	// use if you want to consume a token and copy back with a response
+	// equivalent to the O<token> flag
+	OpaqueToken *string
+
+	// use if you want to set the TTL for the item
+	// equivalent to the T<token> flag
+	UpdateTTLToken *int32
+}
+
+/*
+This function provides functionality in Golang for the meta set command. The meta set command is a more flexible
+approach to setting values in memcached- instead of having multiple methods each do different things, you can consolidate
+everything you wish to do in one line with the meta command and its array of flags.
+
+Arguments
+@metaItem: encapsulates the key of the item, its new value, and all flags to apply to the meta set command
+
+Return values
+@metaDataResponse: encapsulates all values returned as a result of the flags which return a value applied to the meta set command
+@err: error that can be raised as a result of the operation- errors include: error because value wasn't stored, error because of cache miss,
+error because the item alerady exists (occurs with certain flags), I/O errors, malformed key error, and generic error for an unknown response
+from memcached
+*/
+func (c *Client) MetaSet(metaItem *MetaSetItem) (metaDataResponse *MetaResponseMetadata, err error) {
+	err = c.onMetaItem(metaItem, (*Client).processMetaSet, func(metaData *MetaResponseMetadata) { metaDataResponse = metaData })
+	return
+}
+
+func (c *Client) onMetaItem(item *MetaSetItem, fn func(*Client, *bufio.ReadWriter, *MetaSetItem, func(metaData *MetaResponseMetadata)) error, cb func(metaData *MetaResponseMetadata)) error {
+	addr, err := c.selector.PickServer(item.Key)
+	if err != nil {
+		return err
+	}
+	cn, err := c.getConn(addr)
+	if err != nil {
+		return err
+	}
+	defer cn.condRelease(&err)
+	if err = fn(c, cn.rw, item, cb); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (c *Client) processMetaSet(rw *bufio.ReadWriter, item *MetaSetItem, cb func(*MetaResponseMetadata)) error {
+	if !legalKey(item.Key) {
+		return ErrMalformedKey
+	}
+
+	command := c.parseFlagsForMetaSet(item)
+
+	var err error
+	_, err = fmt.Fprintf(rw, command)
+
+	if err != nil {
+		return nil
+	}
+	if _, err = rw.Write(item.Value); err != nil {
+		return err
+	}
+	if _, err := rw.Write(crlf); err != nil {
+		return err
+	}
+	if err := rw.Flush(); err != nil {
+		return err
+	}
+	response, err := rw.ReadSlice('\n')
+	if err != nil {
+		return err
+	}
+	switch {
+	case bytes.HasPrefix(response, metaResultStored):
+		// the first two characters are being processed in this switch-case block, the other cases are all errors
+		// so we don't need to save them into the meta data object
+		responseMetadataComponents := strings.Fields(string(response))[1:]
+		metaResponseMetadata := new(MetaResponseMetadata)
+		if err = parseMetaResponseMetadata(responseMetadataComponents, metaResponseMetadata); err != nil {
+			return err
+		}
+		cb(metaResponseMetadata)
+		return nil
+	case bytes.HasPrefix(response, metaResultNotStored):
+		return ErrNotStored
+	case bytes.HasPrefix(response, metaResultExists):
+		return ErrCASConflict
+	case bytes.HasPrefix(response, metaResultNotFound):
+		return ErrCacheMiss
+	}
+	return fmt.Errorf("memcache: unexpected response line from ms: %q", string(response))
+}
+
+//function reads the  response from meta commands and returns a struct MetaResponseMetadata
+//response of meta commands contain flags which are single characters.
+// For ex if MetaGetFlags.ReturnTTLRemainingSecondsInResponse is set to true then response
+//will contain t300. Here 300 is the amount of TTL remaining in Seconds
+func parseMetaResponseMetadata(metaResponseMetadata []string, respMetadata *MetaResponseMetadata) error {
+	if len(metaResponseMetadata) != 0 {
+		for _, metadata := range metaResponseMetadata {
+			if err := populateMetaResponseMetadata(metadata, respMetadata); err != nil {
+				return err
+			}
+		}
+
+		return nil
+	}
+
+	return nil
+}
+
+//populates the MetaResponseMetadata based on the response flags
+func populateMetaResponseMetadata(metadata string, respMetadata *MetaResponseMetadata) error {
+	var err error
+	respFlagKey := metadata[0:1]
+	respValue := metadata[1:]
+
+	switch {
+	case respFlagKey == casTokenResponseMetaFlag:
+		var casId uint64
+		if casId, err = strconv.ParseUint(respValue, 10, 64); err != nil {
+			return err
+		}
+		respMetadata.CasId = &casId
+	case respFlagKey == returnKeyAsTokenMetaFlag:
+		key := respValue
+		respMetadata.ItemKey = &key
+	case respFlagKey == opaqueTokenMetaFlag:
+		token := respValue
+		respMetadata.OpaqueToken = &token
+	case respFlagKey == ttlResponseMetaFlag:
+		var ttl int64
+		if ttl, err = strconv.ParseInt(respValue, 10, 32); err != nil {
+			return err
+		}
+		ttl32 := int32(ttl)
+		respMetadata.TTLRemainingInSeconds = &ttl32
+	}
+
+	return nil
+}
+
+func (c *Client) parseFlagsForMetaSet(metaItem *MetaSetItem) string {
+	var commandBuilder strings.Builder
+	commandBuilder.WriteString(fmt.Sprintf("ms %s %d", metaItem.Key, len(metaItem.Value)))
+
+	itemFlags := metaItem.Flags
+	if itemFlags.IsKeyBase64 {
+		commandBuilder.WriteString(fmt.Sprintf(" %s", base64MetaFlag))
+	}
+	if itemFlags.ReturnCasTokenInResponse {
+		commandBuilder.WriteString(fmt.Sprintf(" %s", casTokenResponseMetaFlag))
+	}
+	if itemFlags.Invalidate {
+		commandBuilder.WriteString(fmt.Sprintf(" %s", invalidateMetaFlag))
+	}
+	if itemFlags.ReturnKeyInResponse {
+		commandBuilder.WriteString(fmt.Sprintf(" %s", returnKeyAsTokenMetaFlag))
+	}
+	if itemFlags.UseNoReplySemanticsForResponse {
+		commandBuilder.WriteString(fmt.Sprintf(" %s", noReplySemanticsMetaFlag))
+	}
+	if itemFlags.CompareCasTokenToUpdateValue != nil {
+		commandBuilder.WriteString(fmt.Sprintf(" %s%d", compareCasValueTokenMetaFlag, *itemFlags.CompareCasTokenToUpdateValue))
+	}
+	if itemFlags.ClientFlagToken != nil {
+		commandBuilder.WriteString(fmt.Sprintf(" %s%d", setClientFlagsToTokenMetaFlag, *itemFlags.ClientFlagToken))
+	}
+	if itemFlags.OpaqueToken != nil {
+		commandBuilder.WriteString(fmt.Sprintf(" %s%s", opaqueTokenMetaFlag, *itemFlags.OpaqueToken))
+	}
+	if itemFlags.UpdateTTLToken != nil {
+		commandBuilder.WriteString(fmt.Sprintf(" %s%d", updateTTLTokenMetaFlag, *itemFlags.UpdateTTLToken))
+	}
+	if itemFlags.SetModeToken != "" {
+		commandBuilder.WriteString(fmt.Sprintf(" %s%s", modeTokenMetaFlag, itemFlags.SetModeToken))
+	}
+	commandBuilder.WriteString("\r\n")
+
+	return commandBuilder.String()
 }

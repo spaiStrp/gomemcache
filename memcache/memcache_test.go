@@ -19,6 +19,7 @@ package memcache
 
 import (
 	"bufio"
+	"bytes"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -86,6 +87,9 @@ func testWithClient(t *testing.T, c *Client) {
 		}
 	}
 	mustSet := mustSetF(t, c)
+
+	// test meta commands
+	testMetaSetCommandsWithClient(t, c, checkErr)
 
 	// Set
 	foo := &Item{Key: "foo", Value: []byte("fooval"), Flags: 123}
@@ -259,6 +263,157 @@ func testTouchWithClient(t *testing.T, c *Client) {
 			t.Fatalf("unexpected error retrieving bar: %v", err.Error())
 		}
 	}
+}
+
+func testMetaSetCommandsWithClient(t *testing.T, c *Client, checkErr func(err error, format string, args ...interface{})) {
+	key := "bah"
+	value := []byte("bahval")
+	opaqueToken := "A123"
+	metaFoo := &MetaSetItem{Key: key, Value: value, Flags: MetaSetFlags{ReturnKeyInResponse: true, ReturnCasTokenInResponse: true, OpaqueToken: &opaqueToken}}
+	response, err := c.MetaSet(metaFoo)
+	if *response.ItemKey != key {
+		t.Errorf("meta set(%s) Key = %q, want %s", key, *response.ItemKey, key)
+	}
+	if *response.OpaqueToken != opaqueToken {
+		t.Errorf("meta set(%s) Opaque token = %s, want %s", key, *response.OpaqueToken, opaqueToken)
+	}
+	casToken := response.CasId
+	if casToken == nil {
+		t.Errorf("meta set(%s) error, no CAS token returned", key)
+	}
+	checkErr(err, "normal meta set(%s): %v", key, err)
+	testMetaSetSavedValue(t, c, checkErr, key, value)
+
+	// set using the same cas token as what was last set
+	value = []byte("new_bah_val")
+	var newTTL int32 = 900000
+	var clientFlagToken uint32 = 90
+	metaFoo = &MetaSetItem{Key: key, Value: value, Flags: MetaSetFlags{CompareCasTokenToUpdateValue: casToken, ClientFlagToken: &clientFlagToken, UpdateTTLToken: &newTTL}}
+	response, err = c.MetaSet(metaFoo)
+	checkErr(err, "Same CAS token meta set(%s): %v", key, err)
+	it, err := c.Get(key)
+	if it.Flags != clientFlagToken {
+		t.Errorf("Same CAS token meta set(%s) expected client flag %d but got %d", key, clientFlagToken, it.Flags)
+	}
+	testMetaSetSavedValue(t, c, checkErr, key, value)
+
+	// set using a different cas token
+	value = []byte("byte_val_invalid")
+	var newCasToken uint64 = 123456789
+	metaFoo = &MetaSetItem{Key: key, Value: value, Flags: MetaSetFlags{CompareCasTokenToUpdateValue: &newCasToken}}
+	_, err = c.MetaSet(metaFoo)
+	if err != ErrCASConflict {
+		t.Errorf("Differnet CAS token meta set(%s) expected an CAS conflict error but got %e", key, err)
+	}
+
+	// set with no reply semantics turned on
+	// note that the documentation says that this flag will always return an error (even if the command runs successfully)
+	value = []byte("with_base64_key")
+	metaFoo = &MetaSetItem{Key: key, Value: value, Flags: MetaSetFlags{UseNoReplySemanticsForResponse: true}}
+	_, err = c.MetaSet(metaFoo)
+	// the error raised is an internal error, so we can't change for explicit type
+	if err == nil {
+		t.Errorf("no reply meta set(%s) expected an error to be returned but got none", key)
+	}
+
+	// set using the append mode with existing key
+	valueToAppend := []byte("append_value_to_existing")
+	value = append(value, valueToAppend...)
+	metaFoo = &MetaSetItem{Key: key, Value: valueToAppend, Flags: MetaSetFlags{SetModeToken: Append}}
+	_, err = c.MetaSet(metaFoo)
+	checkErr(err, "successful append meta set(%s): %v", key, err)
+	testMetaSetSavedValue(t, c, checkErr, key, value)
+
+	// set using the prepend mode
+	valueToPrepend := []byte("prepend_value_to_existing")
+	value = append(valueToPrepend, value...)
+	metaFoo = &MetaSetItem{Key: key, Value: valueToPrepend, Flags: MetaSetFlags{SetModeToken: Prepend}}
+	_, err = c.MetaSet(metaFoo)
+	checkErr(err, "successful prepend meta set(%s): %v", key, err)
+	testMetaSetSavedValue(t, c, checkErr, key, value)
+
+	// set using the add mode and existing key
+	// will fail to store and return ErrNotStored error because key is in use
+	metaFoo = &MetaSetItem{Key: key, Value: []byte("add_value_to_existing"), Flags: MetaSetFlags{SetModeToken: Add}}
+	_, err = c.MetaSet(metaFoo)
+	if err != ErrNotStored {
+		t.Errorf("add mode with existing key meta set(%s) expected not stored error but got %e", key, err)
+	}
+
+	// set using the replace mode
+	value = []byte("replacement_value")
+	metaFoo = &MetaSetItem{Key: key, Value: value, Flags: MetaSetFlags{SetModeToken: Replace}}
+	_, err = c.MetaSet(metaFoo)
+	checkErr(err, "successful replace mode meta set(%s): %v", key, err)
+	testMetaSetSavedValue(t, c, checkErr, key, value)
+
+	// set using the add mode
+	// will store because key is not in use
+	key = "new_key"
+	value = []byte("add_value_to_new_key")
+	metaFoo = &MetaSetItem{Key: key, Value: value, Flags: MetaSetFlags{SetModeToken: Add}}
+	_, err = c.MetaSet(metaFoo)
+	checkErr(err, "add mode without existing key meta set(%s): %v", key, err)
+	testMetaSetSavedValue(t, c, checkErr, key, value)
+
+	// set using base64 encoded string
+	key = "bmV3QmFzZUtleQ=="
+	decodedKey := "newBaseKey"
+	value = []byte("with_base64_key")
+	metaFoo = &MetaSetItem{Key: key, Value: value, Flags: MetaSetFlags{IsKeyBase64: true}}
+	_, err = c.MetaSet(metaFoo)
+	checkErr(err, "base64 encoded key meta set(%s): %v", key, err)
+	testMetaSetSavedValue(t, c, checkErr, decodedKey, value)
+
+	// set using the append mode with non-existent key
+	valueToAppend = []byte("new_append_value")
+	key = "non_existing_for_append"
+	metaFoo = &MetaSetItem{Key: key, Value: valueToAppend, Flags: MetaSetFlags{SetModeToken: Append}}
+	_, err = c.MetaSet(metaFoo)
+	if err != ErrNotStored {
+		t.Errorf("Append with non-existent key meta set(%s) expected a not stored error but got %e", key, err)
+	}
+
+	// set using the prepend mode with non-existent key
+	valueToPrepend = []byte("new_prepend_value")
+	key = "non_existing_for_prepend"
+	metaFoo = &MetaSetItem{Key: key, Value: valueToPrepend, Flags: MetaSetFlags{SetModeToken: Prepend}}
+	_, err = c.MetaSet(metaFoo)
+	if err != ErrNotStored {
+		t.Errorf("Prepend with non-existent key meta set(%s) expected a not stored error but got %e", key, err)
+	}
+
+	// set using the replace mode with non-existent key
+	value = []byte("new_replace_value")
+	key = "non_existing_for_replace"
+	metaFoo = &MetaSetItem{Key: key, Value: value, Flags: MetaSetFlags{SetModeToken: Replace}}
+	_, err = c.MetaSet(metaFoo)
+	if err != ErrNotStored {
+		t.Errorf("Replace with non-existent key meta set(%s) expected a not stored error but got %e", key, err)
+	}
+}
+
+func testMetaSetSavedValue(t *testing.T, c *Client, checkErr func(err error, format string, args ...interface{}), key string, value []byte) {
+	it, err := c.Get(key)
+	checkErr(err, "get(%s): %v", key, err)
+	if it.Key != key {
+		t.Errorf("get(%s) Key = %q, want %s", key, it.Key, key)
+	}
+	if bytes.Compare(it.Value, value) != 0 {
+		t.Errorf("get(%s) Value = %q, want %q", key, string(it.Value), string(value))
+	}
+}
+
+func stringSlicesEqual(a, b []byte) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i, v := range a {
+		if v != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func BenchmarkOnItem(b *testing.B) {

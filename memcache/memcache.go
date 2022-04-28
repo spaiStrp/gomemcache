@@ -198,46 +198,46 @@ type Item struct {
 type MetaGetFlags struct {
 
 	//Should be true if the key passed to MetaGet is in base64Format.
-	//Same as Meta Get -b option
+	//Same as Meta Get b option
 	IsKeyBase64 bool
 
 	//Set this to true if cas token should be included in meta get response metadata
-	//Same as Meta Get -c option
+	//Same as Meta Get c option
 	ReturnCasTokenInResponse bool
 
 	//Set this to true if client flags should be included in meta get response metadata
-	//Same as Meta Get -f option
+	//Same as Meta Get f option
 	ReturnClientFlagsInResponse bool
 
 	//Set this to true if you want to know if an item is hit before
-	//Same as Meta Get -h option
+	//Same as Meta Get h option
 	ReturnItemHitInResponse bool
 
 	//Set this to true if key should be included in meta get response metadata
-	//Same as Meta Get -k option
+	//Same as Meta Get k option
 	ReturnKeyInResponse bool
 
 	//Set this to true if last time since item was accessed in Seconds
 	//be included in meta get response metadata
-	//Same as Meta Get -l option
+	//Same as Meta Get l option
 	ReturnLastAccessedTimeSecondsInResponse bool
 
 	//Set this to true if item size in bytes should be included in meta get response metadata
-	//Same as Meta Get -s option
+	//Same as Meta Get s option
 	ReturnItemSizeBytesInResponse bool
 
 	//Set this to true if remaining ttl of the item should be included in meta get response metadata
-	//Same as Meta Get -t option
+	//Same as Meta Get t option
 	ReturnTTLRemainingSecondsInResponse bool
 
 	//Set this to true to access an item without causing it to be "bumped" to the head
 	//of the LRU. This also avoids marking an item as being hit or updating its last
 	//access time.
-	//Same as Meta Get -u option
+	//Same as Meta Get u option
 	DontBumpItemInLRU bool
 
 	//opaque value, consumes a token and copies back with response
-	//Same as Meta Get -O option
+	//Same as Meta Get O option
 	OpaqueToken *string
 
 	//If supplied, and meta get does not find the item in cache, it will
@@ -247,18 +247,18 @@ type MetaGetFlags struct {
 	//The automatically created item has 0 bytes of data.
 	//Further, requests will see a IsReCacheWonFlagAlreadySent set to true in MetaResponseMetadata
 	//to indicate that another client has already received the win flag.
-	//Same as Meta Get -N option
+	//Same as Meta Get N option
 	VivifyTTLToken *int32
 
 	//If the remaining TTL of an item is
 	//below the supplied token, IsReCacheWonFlagSet in MetaResponseMetadata will be set to true
 	//to indicate the client has "won" the right to re cache an item. This allows refreshing an item before it leads to
 	//a miss.
-	//Same as Meta Get -R option
+	//Same as Meta Get R option
 	ReCacheTTLToken *int32
 
 	//updates the remaining TTL of an item if hit.
-	//Same as Meta Get -R option
+	//Same as Meta Get T option
 	UpdateTTLToken *int32
 }
 
@@ -268,7 +268,7 @@ type MetaGetFlags struct {
 type MetaResponseMetadata struct {
 
 	//Cache value. This will be always present for Meta get command
-	Value []byte
+	ReturnItemValue []byte
 	//Compare and set token
 	CasId *uint64
 	//TTL remaining in seconds for the value. -1 means unlimited
@@ -680,23 +680,23 @@ func parseMetaGetResponse(r *bufio.Reader, cb func(metadata *MetaResponseMetadat
 	}
 
 	metaRespMetadata := new(MetaResponseMetadata)
-	metaRespMetadata.Value = make([]byte, size+2)
+	metaRespMetadata.ReturnItemValue = make([]byte, size+2)
 
 	//populate value
-	_, err = io.ReadFull(r, metaRespMetadata.Value)
+	_, err = io.ReadFull(r, metaRespMetadata.ReturnItemValue)
 
 	if err != nil {
-		metaRespMetadata.Value = nil
+		metaRespMetadata.ReturnItemValue = nil
 		return err
 	}
 
 	//check if value has a suffix of clrf (i.e. \r\n)
-	if !bytes.HasSuffix(metaRespMetadata.Value, crlf) {
-		metaRespMetadata.Value = nil
+	if !bytes.HasSuffix(metaRespMetadata.ReturnItemValue, crlf) {
+		metaRespMetadata.ReturnItemValue = nil
 		return fmt.Errorf("memcache: corrupt meta get result read")
 	}
 
-	metaRespMetadata.Value = metaRespMetadata.Value[:size]
+	metaRespMetadata.ReturnItemValue = metaRespMetadata.ReturnItemValue[:size]
 
 	responseMetadata := responseComponents[2:]
 
@@ -818,7 +818,7 @@ func convertToUInt32(num string) (*uint32, error) {
 func getMemCacheErrorFromResponse(response []byte) error {
 	switch {
 	case bytes.HasPrefix(response, resultErrorPrefix):
-		return errors.New("memcache: unrecognized command name.")
+		return errors.New("memcache: unsupported fucntionality/command.")
 	case bytes.HasPrefix(response, resultClientErrorPrefix):
 		errMsg := response[len(resultClientErrorPrefix) : len(response)-2]
 		return errors.New("memcache: client error: " + string(errMsg))

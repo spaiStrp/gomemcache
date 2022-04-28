@@ -222,6 +222,7 @@ func testMetaGetWithClient(t *testing.T, c *Client,
 	c.DeleteAll()
 	defer c.DeleteAll()
 
+	//preparing some test data for test cases
 	key := &Item{Key: "key", Value: []byte("value")}
 	err := c.Set(key)
 	checkErr(err, "first set(key): %v", err)
@@ -237,14 +238,14 @@ func testMetaGetWithClient(t *testing.T, c *Client,
 	//simple meta get
 	respMetadata, err := c.MetaGet("key", nil)
 	checkErr(err, "first metaGet(key): %v", err)
-	if string(respMetadata.Value) != "value" {
-		t.Errorf("metaGet(key) Value=%q, expected value", string(respMetadata.Value))
+	if string(respMetadata.ReturnItemValue) != "value" {
+		t.Errorf("metaGet(key) Actual Value=%q, Expected Value=value", string(respMetadata.ReturnItemValue))
 	}
 
 	respMetadata, err = c.MetaGet("key", &MetaGetFlags{})
 	checkErr(err, "second metaGet(key): %v", err)
-	if string(respMetadata.Value) != "value" {
-		t.Errorf("metaGet(key) Value=%q, expected value", string(respMetadata.Value))
+	if string(respMetadata.ReturnItemValue) != "value" {
+		t.Errorf("metaGet(key) Actual Value=%q, Expected Value=value", string(respMetadata.ReturnItemValue))
 	}
 
 	//meta get with base64 key , returnItemHitInResponse, LastAccessedTime, ItemSize and flags
@@ -253,8 +254,8 @@ func testMetaGetWithClient(t *testing.T, c *Client,
 		ReturnItemSizeBytesInResponse: true, ReturnClientFlagsInResponse: true,
 		ReturnKeyInResponse: true})
 	checkErr(err, "third metaGet(key2): %v", err)
-	if string(respMetadata.Value) != "value\r\n" {
-		t.Errorf("metaGet(key2) Value=%q, expected value", string(respMetadata.Value))
+	if string(respMetadata.ReturnItemValue) != "value\r\n" {
+		t.Errorf("metaGet(key2) Value=%q, Expected Value=value", string(respMetadata.ReturnItemValue))
 	}
 	if respMetadata.isItemHitBefore == nil || *respMetadata.isItemHitBefore == true {
 		t.Errorf("metaGet(key2) isItemHitBefore should not be nil but should be false")
@@ -346,7 +347,7 @@ func testMetaGetWithClient(t *testing.T, c *Client,
 	if respMetadata.IsReCacheWonFlagSet == nil || *respMetadata.IsReCacheWonFlagSet != true {
 		t.Errorf("metaGet(key5) IsReCacheWonFlagSet should not be nil but should be true")
 	}
-	if string(respMetadata.Value) != "" {
+	if string(respMetadata.ReturnItemValue) != "" {
 		t.Errorf("metaGet(key5) value should be empty")
 	}
 

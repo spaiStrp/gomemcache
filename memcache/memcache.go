@@ -755,7 +755,7 @@ type MetaSetItem struct {
 }
 
 type MetaResponseMetadata struct {
-	Value                 []byte
+	ReturnItemValue       []byte
 	CasId                 *uint64
 	ItemKey               *string
 	OpaqueToken           *string

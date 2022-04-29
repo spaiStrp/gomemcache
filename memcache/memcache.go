@@ -70,6 +70,25 @@ const (
 	// DefaultMaxIdleConns is the default maximum number of idle connections
 	// kept for any single address.
 	DefaultMaxIdleConns = 2
+
+	//Meta commands flag constants
+	base64MetaFlag                        = "b"
+	casTokenResponseMetaFlag              = "c"
+	itemValueMetaFlag                     = "v"
+	ttlResponseMetaFlag                   = "t"
+	updateTTLTokenMetaFlag                = "T"
+	returnKeyAsTokenMetaFlag              = "k"
+	clientFlagsResponseMetaFlag           = "f"
+	itemHitResponseMetaFlag               = "h"
+	lastAccessTimeResponseMetaFlag        = "l"
+	itemSizeResponseMetaFlag              = "s"
+	opaqueTokenMetaFlag                   = "O"
+	reCacheWonResponseMetaFlag            = "W"
+	itemStaleResponseMetaFlag             = "X"
+	reCacheWonAlreadySentResponseMetaFlag = "Z"
+	vivifyOnMissTokenMetaFlag             = "N"
+	reCacheTTLTokenMetaFlag               = "R"
+	dontBumpItemInLruMetaFlag             = "u"
 )
 
 const buffered = 8 // arbitrary buffered channel size, for readability
@@ -112,7 +131,11 @@ var (
 	resultTouched   = []byte("TOUCHED\r\n")
 
 	resultClientErrorPrefix = []byte("CLIENT_ERROR ")
+	resultServerErrorPrefix = []byte("SERVER_ERROR ")
+	resultErrorPrefix       = []byte("ERROR")
 	versionPrefix           = []byte("VERSION")
+	metaGetMissPrefix       = []byte("EN")
+	metaValuePrefix         = []byte("VA")
 )
 
 // New returns a memcache client using the provided server(s)
@@ -169,6 +192,109 @@ type Item struct {
 
 	// Compare and swap ID.
 	casid uint64
+}
+
+// MetaGetFlags are the flags supported by MetaGet function
+type MetaGetFlags struct {
+
+	//Should be true if the key passed to MetaGet is in base64Format.
+	//Same as Meta Get b option
+	IsKeyBase64 bool
+
+	//Set this to true if cas token should be included in meta get response metadata
+	//Same as Meta Get c option
+	ReturnCasTokenInResponse bool
+
+	//Set this to true if client flags should be included in meta get response metadata
+	//Same as Meta Get f option
+	ReturnClientFlagsInResponse bool
+
+	//Set this to true if you want to know if an item is hit before
+	//Same as Meta Get h option
+	ReturnItemHitInResponse bool
+
+	//Set this to true if key should be included in meta get response metadata
+	//Same as Meta Get k option
+	ReturnKeyInResponse bool
+
+	//Set this to true if last time since item was accessed in Seconds
+	//be included in meta get response metadata
+	//Same as Meta Get l option
+	ReturnLastAccessedTimeSecondsInResponse bool
+
+	//Set this to true if item size in bytes should be included in meta get response metadata
+	//Same as Meta Get s option
+	ReturnItemSizeBytesInResponse bool
+
+	//Set this to true if remaining ttl of the item should be included in meta get response metadata
+	//Same as Meta Get t option
+	ReturnTTLRemainingSecondsInResponse bool
+
+	//Set this to true to access an item without causing it to be "bumped" to the head
+	//of the LRU. This also avoids marking an item as being hit or updating its last
+	//access time.
+	//Same as Meta Get u option
+	DontBumpItemInLRU bool
+
+	//opaque value, consumes a token and copies back with response
+	//Same as Meta Get O option
+	OpaqueToken *string
+
+	//If supplied, and meta get does not find the item in cache, it will
+	//create a stub item with the key and TTL as supplied.
+	//If such an item is created a 	IsReCacheWonFlagSet in MetaResponseMetadata will be set to true
+	//to indicate to a client that they have "won" the right to re cache an item.
+	//The automatically created item has 0 bytes of data.
+	//Further, requests will see a IsReCacheWonFlagAlreadySent set to true in MetaResponseMetadata
+	//to indicate that another client has already received the win flag.
+	//Same as Meta Get N option
+	VivifyTTLToken *int32
+
+	//If the remaining TTL of an item is
+	//below the supplied token, IsReCacheWonFlagSet in MetaResponseMetadata will be set to true
+	//to indicate the client has "won" the right to re cache an item. This allows refreshing an item before it leads to
+	//a miss.
+	//Same as Meta Get R option
+	ReCacheTTLToken *int32
+
+	//updates the remaining TTL of an item if hit.
+	//Same as Meta Get T option
+	UpdateTTLToken *int32
+}
+
+//MetaResponseMetadata contains response metadata from meta commands
+//Some of these values can be nil if the corresponding meta flag is not set while calling
+//meta functions
+type MetaResponseMetadata struct {
+
+	//Cache value. This will be always present for Meta get command
+	ReturnItemValue []byte
+	//Compare and set token
+	CasId *uint64
+	//TTL remaining in seconds for the value. -1 means unlimited
+	TTLRemainingInSeconds *int32
+	//Cache key
+	ItemKey *string
+	//Client flags
+	ClientFlag *uint32
+	//Will be true if an item has been hit before
+	isItemHitBefore *bool
+	//Cache value size in bytes
+	ItemSizeInBytes *uint64
+	//Time since item was last accessed in seconds
+	TimeInSecondsSinceLastAccessed *uint32
+	//Opaque token
+	OpaqueToken *string
+	//Will be true if client has won the re cache
+	//same as -W flag from mem cache
+	IsReCacheWonFlagSet *bool
+	//if this is true then it indicates that a different client
+	//is responsible for re caching this item
+	//same as -Z flag from memcache
+	IsReCacheWonFlagAlreadySent *bool
+	//Will be true if the item is stale
+	//same as -X flag from memcache
+	isItemStale *bool
 }
 
 // conn is a connection to a server.
@@ -483,6 +609,266 @@ func (c *Client) GetMulti(keys []string) (map[string]*Item, error) {
 		}
 	}
 	return m, err
+}
+
+//MetaGet function returns value for a cached item given a key. It also accepts few MetaGetFlags
+//which supports additional functionality.
+//ErrCacheMiss is returned if a key is not found
+//The key must be at most 250 bytes in length.
+func (c *Client) MetaGet(key string, metaGetFlags *MetaGetFlags) (metaResponseMetadata *MetaResponseMetadata, err error) {
+	err = c.withKeyAddr(key, func(addr net.Addr) error {
+		return c.metaGetFromAddr(addr,
+			key,
+			metaGetFlags,
+			func(metaGetRes *MetaResponseMetadata) { metaResponseMetadata = metaGetRes })
+	})
+	return
+}
+
+func (c *Client) metaGetFromAddr(addr net.Addr, key string, metaGetFlags *MetaGetFlags, cb func(response *MetaResponseMetadata)) error {
+
+	return c.withAddrRw(addr, func(rw *bufio.ReadWriter) error {
+		metaGetCommandFlags := createMetaGetFlagCommands(metaGetFlags)
+		if _, err := fmt.Fprintf(rw, "mg %s %s\r\n", key, metaGetCommandFlags); err != nil {
+			return err
+		}
+		if err := rw.Flush(); err != nil {
+			return err
+		}
+
+		if err := parseMetaGetResponse(rw.Reader, cb); err != nil {
+			return err
+		}
+		return nil
+
+	})
+
+}
+
+//function parses meta get response
+func parseMetaGetResponse(r *bufio.Reader, cb func(metadata *MetaResponseMetadata)) error {
+
+	response, err := r.ReadSlice('\n')
+	if err != nil {
+		return err
+	}
+
+	switch {
+	//Check if cache miss has occurred
+	case bytes.HasPrefix(response, metaGetMissPrefix):
+		return ErrCacheMiss
+
+	//metaGet command response will be in the format
+	//VA <size> <flags>*\r\n
+	//<data block>\r\n
+	case bytes.HasPrefix(response, metaValuePrefix):
+		responseComponents := strings.Fields(string(response))
+		var size int
+		//read value size
+		if size, err = strconv.Atoi(responseComponents[1]); err != nil {
+			return err
+		}
+		//if itemValue, err = getItemValueFromResponse(r, size); err != nil {
+		//	return err
+		//}
+
+		itemValue := make([]byte, size+2)
+		//populate value
+		_, err := io.ReadFull(r, itemValue)
+
+		if err != nil {
+			return err
+		}
+
+		//check if value has a suffix of clrf (i.e. \r\n)
+		if !bytes.HasSuffix(itemValue, crlf) {
+			return fmt.Errorf("memcache: corrupt meta get result read")
+		}
+
+		metaRespMetadata := new(MetaResponseMetadata)
+		metaRespMetadata.ReturnItemValue = itemValue[:size]
+
+		responseMetadata := responseComponents[2:]
+		if err = parseMetaResponseMetadata(responseMetadata, metaRespMetadata); err != nil {
+			return err
+		}
+		cb(metaRespMetadata)
+
+		return nil
+	default:
+		return fmt.Errorf("memcache: unexpected response line from ms: %q", string(response))
+	}
+}
+
+//function reads the  response from meta commands and returns a struct MetaResponseMetadata
+//response of meta commands contain flags which are single characters.
+// For ex if MetaGetFlags.ReturnTTLRemainingSecondsInResponse is set to true then response
+//will contain t300. Here 300 is the amount of TTL remaining in Seconds
+func parseMetaResponseMetadata(metaResponseMetadata []string, metaRespMetadata *MetaResponseMetadata) error {
+
+	for _, metadata := range metaResponseMetadata {
+		if err := populateMetaResponseMetadata(metadata, metaRespMetadata); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+//populates the MetaResponseMetadata based on the response flags
+func populateMetaResponseMetadata(metadata string, respMetadata *MetaResponseMetadata) error {
+
+	var err error
+
+	respFlagKey := metadata[0:1]
+	respValue := metadata[1:]
+	switch {
+
+	case respFlagKey == casTokenResponseMetaFlag:
+		var casId uint64
+		if casId, err = strconv.ParseUint(respValue, 10, 64); err != nil {
+			return err
+		}
+		respMetadata.CasId = &casId
+
+	case respFlagKey == ttlResponseMetaFlag:
+		var ttl int64
+
+		if ttl, err = strconv.ParseInt(respValue, 10, 32); err != nil {
+			return err
+		}
+		ttl32 := int32(ttl)
+		respMetadata.TTLRemainingInSeconds = &ttl32
+
+	case respFlagKey == returnKeyAsTokenMetaFlag:
+		respMetadata.ItemKey = &respValue
+
+	case respFlagKey == clientFlagsResponseMetaFlag:
+		var flag *uint32
+		if flag, err = convertToUInt32(respValue); err != nil {
+			return err
+		}
+		respMetadata.ClientFlag = flag
+
+	case respFlagKey == itemHitResponseMetaFlag:
+		hitValue := true
+		if respValue == "0" {
+			hitValue = false
+		}
+		respMetadata.isItemHitBefore = &hitValue
+
+	case respFlagKey == itemSizeResponseMetaFlag:
+		var size uint64
+		if size, err = strconv.ParseUint(respValue, 10, 64); err != nil {
+			return err
+		}
+		respMetadata.ItemSizeInBytes = &size
+
+	case respFlagKey == lastAccessTimeResponseMetaFlag:
+		var lastAccessTime *uint32
+		if lastAccessTime, err = convertToUInt32(respValue); err != nil {
+			return err
+		}
+		respMetadata.TimeInSecondsSinceLastAccessed = lastAccessTime
+
+	case respFlagKey == opaqueTokenMetaFlag:
+		respMetadata.OpaqueToken = &respValue
+
+	case respFlagKey == reCacheWonResponseMetaFlag:
+		reCacheWonFlag := true
+		respMetadata.IsReCacheWonFlagSet = &reCacheWonFlag
+
+	case respFlagKey == itemStaleResponseMetaFlag:
+		itemStaleFlag := true
+		respMetadata.isItemStale = &itemStaleFlag
+
+	case respFlagKey == reCacheWonAlreadySentResponseMetaFlag:
+		reCacheWonFlagAlreadySent := true
+		respMetadata.IsReCacheWonFlagAlreadySent = &reCacheWonFlagAlreadySent
+
+	}
+
+	return nil
+}
+
+func convertToUInt32(num string) (*uint32, error) {
+
+	var err error
+	var uInt64Num uint64
+	var uInt32Num uint32
+	if uInt64Num, err = strconv.ParseUint(num, 10, 32); err != nil {
+		return nil, err
+	}
+	uInt32Num = uint32(uInt64Num)
+	return &uInt32Num, nil
+}
+
+//creates the necessary meta get flag commands from the MetaGetFlags struct
+func createMetaGetFlagCommands(metaFlags *MetaGetFlags) string {
+
+	var metaFlagCommands strings.Builder
+
+	metaFlagCommands.WriteString(itemValueMetaFlag + " ")
+
+	if metaFlags != nil {
+		if metaFlags.UpdateTTLToken != nil {
+			updateTTLTokenFlag := updateTTLTokenMetaFlag + strconv.FormatInt(int64(*metaFlags.UpdateTTLToken), 10)
+			metaFlagCommands.WriteString(updateTTLTokenFlag + " ")
+		}
+
+		if metaFlags.IsKeyBase64 {
+			metaFlagCommands.WriteString(base64MetaFlag + " ")
+		}
+
+		if metaFlags.ReturnCasTokenInResponse {
+			metaFlagCommands.WriteString(casTokenResponseMetaFlag + " ")
+		}
+
+		if metaFlags.ReturnTTLRemainingSecondsInResponse {
+			metaFlagCommands.WriteString(ttlResponseMetaFlag + " ")
+		}
+
+		if metaFlags.ReturnKeyInResponse {
+			metaFlagCommands.WriteString(returnKeyAsTokenMetaFlag + " ")
+		}
+
+		if metaFlags.ReturnClientFlagsInResponse {
+			metaFlagCommands.WriteString(clientFlagsResponseMetaFlag + " ")
+		}
+
+		if metaFlags.ReturnItemHitInResponse {
+			metaFlagCommands.WriteString(itemHitResponseMetaFlag + " ")
+		}
+
+		if metaFlags.ReturnItemSizeBytesInResponse {
+			metaFlagCommands.WriteString(itemSizeResponseMetaFlag + " ")
+		}
+
+		if metaFlags.ReturnLastAccessedTimeSecondsInResponse {
+			metaFlagCommands.WriteString(lastAccessTimeResponseMetaFlag + " ")
+		}
+
+		if metaFlags.OpaqueToken != nil {
+			opaqueToken := opaqueTokenMetaFlag + *metaFlags.OpaqueToken
+			metaFlagCommands.WriteString(opaqueToken + " ")
+		}
+
+		if metaFlags.VivifyTTLToken != nil {
+			vivifyToken := vivifyOnMissTokenMetaFlag + strconv.FormatInt(int64(*metaFlags.VivifyTTLToken), 10)
+			metaFlagCommands.WriteString(vivifyToken + " ")
+		}
+
+		if metaFlags.ReCacheTTLToken != nil {
+			reCacheTTLToken := reCacheTTLTokenMetaFlag + strconv.FormatInt(int64(*metaFlags.ReCacheTTLToken), 10)
+			metaFlagCommands.WriteString(reCacheTTLToken + " ")
+		}
+
+		if metaFlags.DontBumpItemInLRU {
+			metaFlagCommands.WriteString(dontBumpItemInLruMetaFlag + " ")
+		}
+	}
+
+	return strings.TrimSuffix(metaFlagCommands.String(), " ")
 }
 
 // parseGetResponse reads a GET response from r and calls cb for each

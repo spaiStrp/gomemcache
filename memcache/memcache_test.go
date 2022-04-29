@@ -212,6 +212,170 @@ func testWithClient(t *testing.T, c *Client) {
 	// Test Ping
 	err = c.Ping()
 	checkErr(err, "error ping: %s", err)
+
+	//test Meta get command
+	testMetaGetWithClient(t, c, checkErr)
+}
+
+func testMetaGetWithClient(t *testing.T, c *Client,
+	checkErr func(err error, format string, args ...interface{})) {
+	c.DeleteAll()
+	defer c.DeleteAll()
+
+	//preparing some test data for test cases
+	key := &Item{Key: "key", Value: []byte("value")}
+	err := c.Set(key)
+	checkErr(err, "first set(key): %v", err)
+
+	key2 := &Item{Key: "key2", Value: []byte("value\r\n"), Flags: 345}
+	err = c.Set(key2)
+	checkErr(err, "second set(key): %v", err)
+
+	key3 := &Item{Key: "key3", Value: []byte("value 3")}
+	err = c.Set(key3)
+	checkErr(err, "third set(key3): %v", err)
+
+	//simple meta get
+	respMetadata, err := c.MetaGet("key", nil)
+	checkErr(err, "first metaGet(key): %v", err)
+	if string(respMetadata.ReturnItemValue) != "value" {
+		t.Errorf("metaGet(key) Actual Value=%q, Expected Value=value", string(respMetadata.ReturnItemValue))
+	}
+
+	respMetadata, err = c.MetaGet("key", &MetaGetFlags{})
+	checkErr(err, "second metaGet(key): %v", err)
+	if string(respMetadata.ReturnItemValue) != "value" {
+		t.Errorf("metaGet(key) Actual Value=%q, Expected Value=value", string(respMetadata.ReturnItemValue))
+	}
+
+	//meta get with base64 key , returnItemHitInResponse, LastAccessedTime, ItemSize and flags
+	respMetadata, err = c.MetaGet("a2V5Mg==", &MetaGetFlags{IsKeyBase64: true,
+		ReturnItemHitInResponse: true, ReturnLastAccessedTimeSecondsInResponse: true,
+		ReturnItemSizeBytesInResponse: true, ReturnClientFlagsInResponse: true,
+		ReturnKeyInResponse: true})
+	checkErr(err, "third metaGet(key2): %v", err)
+	if string(respMetadata.ReturnItemValue) != "value\r\n" {
+		t.Errorf("metaGet(key2) Value=%q, Expected Value=value", string(respMetadata.ReturnItemValue))
+	}
+	if respMetadata.isItemHitBefore == nil || *respMetadata.isItemHitBefore == true {
+		t.Errorf("metaGet(key2) isItemHitBefore should not be nil but should be false")
+	}
+	if respMetadata.TimeInSecondsSinceLastAccessed == nil || *respMetadata.TimeInSecondsSinceLastAccessed != 0 {
+		t.Errorf("metaGet(key2) TimeInSecondsSinceLastAccessed should not be nil but should be 0")
+	}
+	if respMetadata.ItemSizeInBytes == nil || *respMetadata.ItemSizeInBytes != 7 {
+		t.Errorf("metaGet(key2) ItemSizeInBytes should not be nil but should be 7")
+	}
+	if respMetadata.ClientFlag == nil || *respMetadata.ClientFlag != 345 {
+		t.Errorf("metaGet(key2) ClientFlag should not be nil but should be 345")
+	}
+	if respMetadata.ItemKey == nil || *respMetadata.ItemKey != "key2" {
+		t.Errorf("metaGet(key2) ItemKey should not be nil but should be key2")
+	}
+
+	//sleep so that we can test ReturnLastAccessedTimeInSeconds
+	time.Sleep(2 * time.Second)
+
+	respMetadata, err = c.MetaGet("key", &MetaGetFlags{
+		ReturnItemHitInResponse: true, ReturnLastAccessedTimeSecondsInResponse: true})
+	checkErr(err, "metaGet(key3): %v", err)
+	if respMetadata.isItemHitBefore == nil || *respMetadata.isItemHitBefore == false {
+		t.Errorf("metaGet(key3) isItemHitBefore should not be nil but should be true")
+	}
+	if respMetadata.TimeInSecondsSinceLastAccessed == nil || *respMetadata.TimeInSecondsSinceLastAccessed == 0 {
+		t.Errorf("metaGet(key2) TimeInSecondsSinceLastAccessed should not be nil but should be non zero")
+	}
+
+	//meta get cache miss
+	respMetadata, err = c.MetaGet("key53", &MetaGetFlags{})
+	if err != ErrCacheMiss {
+		t.Errorf("metaGet(key53) expected error ErrCacheMiss instead of %v", err)
+	}
+
+	//meta get with malformed key
+	respMetadata, err = c.MetaGet("key val", nil)
+	if err != ErrMalformedKey {
+		t.Errorf("metaGet(key val) should return ErrMalformedKey instead of %v", err)
+	}
+
+	//meta get with cas response flag , ttl response flag , key response flag , Opaque token
+	opaqueToken := "Opaque"
+	respMetadata, err = c.MetaGet("key", &MetaGetFlags{ReturnCasTokenInResponse: true,
+		ReturnTTLRemainingSecondsInResponse: true, ReturnKeyInResponse: true,
+		OpaqueToken: &opaqueToken})
+	checkErr(err, "cas,ttl metaGet(key): %v", err)
+	if respMetadata.CasId == nil {
+		t.Errorf("metaGet(key) casid should not be nil")
+	}
+	if respMetadata.TTLRemainingInSeconds == nil || *respMetadata.TTLRemainingInSeconds != -1 {
+		t.Errorf("metaGet(key) TTLRemainingInSeconds should not be nil or should be -1 ")
+	}
+	if respMetadata.ItemKey == nil || *respMetadata.ItemKey != "key" {
+		t.Errorf("metaGet(key) ItemKey should not be nil. Should be key")
+	}
+	if respMetadata.OpaqueToken == nil || *respMetadata.OpaqueToken != "Opaque" {
+		t.Errorf("metaGet(key)  OpaqueToken should not be nil. Should be Opaque")
+	}
+
+	//meta get update ttl and fetch ttl
+	var updateTTlToken int32 = 5000
+	respMetadata, err = c.MetaGet("key", &MetaGetFlags{UpdateTTLToken: &updateTTlToken,
+		ReturnTTLRemainingSecondsInResponse: true})
+	checkErr(err, "ttl,update ttl metaGet(key): %v", err)
+	if respMetadata.TTLRemainingInSeconds == nil || *respMetadata.TTLRemainingInSeconds != 5000 {
+		t.Errorf("metaGet(key) TTLRemainingInSeconds should not be nil. should be 5000")
+	}
+
+	//test DontBumpItemInLRU flag
+	key4 := &Item{Key: "key4", Value: []byte("value")}
+	err = c.Set(key4)
+	checkErr(err, "set(key4): %v", err)
+	respMetadata, err = c.MetaGet("key4", &MetaGetFlags{DontBumpItemInLRU: true})
+	checkErr(err, "metaGet(key4): %v", err)
+
+	respMetadata, err = c.MetaGet("key4", &MetaGetFlags{ReturnLastAccessedTimeSecondsInResponse: true,
+		ReturnItemHitInResponse: true})
+	checkErr(err, "metaGet(key4): %v", err)
+	if respMetadata.isItemHitBefore == nil || *respMetadata.isItemHitBefore == true {
+		t.Errorf("metaGet(key4) isItemHitBefore should not be nil but should be false")
+	}
+
+	//testVivify TTL token
+	var vivifyTTLToken int32 = 300
+	respMetadata, err = c.MetaGet("key5", &MetaGetFlags{VivifyTTLToken: &vivifyTTLToken})
+	checkErr(err, "metaGet(key5): %v", err)
+	if respMetadata.IsReCacheWonFlagSet == nil || *respMetadata.IsReCacheWonFlagSet != true {
+		t.Errorf("metaGet(key5) IsReCacheWonFlagSet should not be nil but should be true")
+	}
+	if string(respMetadata.ReturnItemValue) != "" {
+		t.Errorf("metaGet(key5) value should be empty")
+	}
+
+	respMetadata, err = c.MetaGet("key5", &MetaGetFlags{VivifyTTLToken: &vivifyTTLToken})
+	if respMetadata.IsReCacheWonFlagSet != nil ||
+		respMetadata.IsReCacheWonFlagAlreadySent == nil || *respMetadata.IsReCacheWonFlagAlreadySent == false {
+		t.Errorf("metaGet(key5) IsReCacheWonFlagAlreadySent should not be nil but should be true. IsReCacheWonFlagSet should be nil")
+	}
+
+	//testRecacheTTLToken
+	key6 := &Item{Key: "key6", Value: []byte("value"), Expiration: 300}
+	err = c.Set(key6)
+	checkErr(err, "set(key6): %v", err)
+	time.Sleep(2 * time.Second)
+
+	var reCacheTTLToken int32 = 300
+	respMetadata, err = c.MetaGet("key6", &MetaGetFlags{ReCacheTTLToken: &reCacheTTLToken,
+		ReturnTTLRemainingSecondsInResponse: true})
+	checkErr(err, "metaGet(key6): %v", err)
+	if respMetadata.IsReCacheWonFlagSet == nil || *respMetadata.IsReCacheWonFlagSet != true {
+		t.Errorf("metaGet(key6) IsReCacheWonFlagSet should not be nil but should be true")
+	}
+	respMetadata, err = c.MetaGet("key6", &MetaGetFlags{})
+	checkErr(err, "metaGet(key6): %v", err)
+	if respMetadata.IsReCacheWonFlagSet != nil || respMetadata.IsReCacheWonFlagAlreadySent == nil ||
+		*respMetadata.IsReCacheWonFlagAlreadySent == false {
+		t.Errorf("metaGet(key6) IsReCacheWonFlagSet should not be nil but should be true")
+	}
 }
 
 func testTouchWithClient(t *testing.T, c *Client) {

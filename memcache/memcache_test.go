@@ -336,7 +336,7 @@ func testMetaCommandsWithClient(t *testing.T, c *Client, checkErr func(err error
 
 func testMetaDeleteCommandsWithClient(t *testing.T, c *Client, checkErr func(err error, format string, args ...interface{})) {
 	setForDelete := func(key string, value []byte, flags MetaSetFlags) (metaDataResponse *MetaResponseMetadata, err error) {
-		metaSetItem := &MetaSetItem{Key: key, Value: value, Flags: MetaSetFlags{ReturnCasTokenInResponse: true}}
+		metaSetItem := &MetaSetItem{Key: key, Value: value, Flags: flags}
 		return c.MetaSet(metaSetItem)
 	}
 
@@ -366,19 +366,19 @@ func testMetaDeleteCommandsWithClient(t *testing.T, c *Client, checkErr func(err
 		t.Errorf("Different CAS token meta delete(%s) expected an CAS conflict error but got %e", key, err)
 	}
 
-	// TODO: requires meta get to retrieve the cas token of the set value and TTL after doing an invalidation delete
 	// delete with invalidation and TTL update- expect to see a new CAS token and TTL set
-	// set_response, err = setForDelete(key, value, MetaSetFlags{})
-	// casValue = set_response.CasId
-	// var newTTL int32 = 5000
-	// metaDeleteItem = &MetaDeleteItem{Key: key, Flags: MetaDeleteFlags{Invalidate: true, UpdateTTLToken: &newTTL}}
-	// response, err = c.MetaDelete(metaDeleteItem)
-	// if response.CasId == nil || casValue == response.CasId {
-	// 	t.Errorf("Invalidate meta delete(%s) expected CAS tokens to differ but were the same", key)
-	// }
-	// if response.TTLRemainingInSeconds == nil || response.TTLRemainingInSeconds != &newTTL {
-	// 	t.Errorf("meta delete(%s) TTLRemainingInSeconds should be non-nil and equal to %d", key, newTTL)
-	// }
+	// todo: cannot test proper TTL setting until meta get implementation
+	set_response, err = setForDelete(key, value, MetaSetFlags{ReturnCasTokenInResponse: true})
+	casValue = set_response.CasId
+	var newTTL int32 = 5000
+	metaDeleteItem = &MetaDeleteItem{Key: key, Flags: MetaDeleteFlags{Invalidate: true, UpdateTTLToken: &newTTL}}
+	response, err = c.MetaDelete(metaDeleteItem)
+	// after invalidation, the cas token should differ, so the CompareAndSwap method should raise an error when using the pre-delete CAS ID
+	metaItem := &Item{Key: key, Value: []byte("new_val_for_invalidation"), casid: *casValue}
+	err = c.CompareAndSwap(metaItem)
+	if err != ErrCASConflict {
+		t.Errorf("invalidation meta delete(%s) expected CAS error to be returned but got %e", key, err)
+	}
 
 	// delete with no-reply semantics
 	// note that the documentation says that this flag will always return an error (even if the command runs successfully)
@@ -390,19 +390,26 @@ func testMetaDeleteCommandsWithClient(t *testing.T, c *Client, checkErr func(err
 		t.Errorf("no reply meta delete(%s) expected an error to be returned but got none", key)
 	}
 
-	// delete with base-64 encoded key
-	// key = "bmV3QmFzZUtleQ=="
-	// decodedKey := "newBaseKey"
-	// set_response, err = setForDelete(key, value, MetaSetFlags{IsKeyBase64: true, ReturnKeyInResponse: true})
-	// metaDeleteItem = &MetaDeleteItem{Key: key, Flags: MetaDeleteFlags{IsKeyBase64: true, ReturnKeyInResponse: true}}
-	// response, err = c.MetaDelete(metaDeleteItem)
-	// if response.Key == nil {
-	// 	t.Errorf("base-64 encoded key meta delete(%s) expected decoded key to be %s but was nil", key, decodedKey)
-	// }
-	// if *response.Key != decodedKey {
-	// 	t.Errorf("base-64 encoded key meta delete(%s) expected decoded key to be %s but was %s", key, decodedKey, *response.Key)
-	// }
-	// checkErr(err, "base-64 encoded key meta delete(%s): %v", key, err)
+	// delete with base-64 encoded key where decodedKey = newBaseKey
+	key = "bmV3QmFzZUtleQ=="
+	decodedKey := "newBaseKey"
+	set_response, err = setForDelete(key, value, MetaSetFlags{IsKeyBase64: true, ReturnKeyInResponse: true})
+	metaDeleteItem = &MetaDeleteItem{Key: key, Flags: MetaDeleteFlags{IsKeyBase64: true, ReturnKeyInResponse: true}}
+	// check that the item was set with the properly decoded key before deleting
+	it, err := c.Get(decodedKey)
+	if it == nil {
+		t.Errorf("base-64 encoded key meta set(%s) expected did not set", key)
+	}
+	response, err = c.MetaDelete(metaDeleteItem)
+	if response.Key == nil || *response.Key != key {
+		t.Errorf("base-64 encoded key meta delete(%s) expected key to be non-nil and %s", key, key)
+	}
+	checkErr(err, "base-64 encoded key meta delete(%s): %v", key, err)
+	// check that the item is no longer able to be received with the decoded key post delete
+	it, err = c.Get(decodedKey)
+	if it != nil {
+		t.Errorf("base-64 encoded key meta delete(%s) did not delete item", key)
+	}
 }
 
 func stringSlicesEqual(a, b []byte) bool {

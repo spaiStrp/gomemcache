@@ -645,26 +645,6 @@ func (c *Client) metaGetFromAddr(addr net.Addr, key string, metaGetFlags *MetaGe
 
 }
 
-//reads the item value from response reader given size and
-//returns byte[]
-func getItemValueFromResponse(r *bufio.Reader, size int) ([]byte, error) {
-
-	itemValue := make([]byte, size+2)
-	//populate value
-	_, err := io.ReadFull(r, itemValue)
-
-	if err != nil {
-		return nil, err
-	}
-
-	//check if value has a suffix of clrf (i.e. \r\n)
-	if !bytes.HasSuffix(itemValue, crlf) {
-		return nil, fmt.Errorf("memcache: corrupt meta get result read")
-	}
-
-	return itemValue[:size], nil
-}
-
 //function parses meta get response
 func parseMetaGetResponse(r *bufio.Reader, cb func(metadata *MetaResponseMetadata)) error {
 
@@ -688,13 +668,25 @@ func parseMetaGetResponse(r *bufio.Reader, cb func(metadata *MetaResponseMetadat
 		if size, err = strconv.Atoi(responseComponents[1]); err != nil {
 			return err
 		}
-		var itemValue []byte
-		if itemValue, err = getItemValueFromResponse(r, size); err != nil {
+		//if itemValue, err = getItemValueFromResponse(r, size); err != nil {
+		//	return err
+		//}
+
+		itemValue := make([]byte, size+2)
+		//populate value
+		_, err := io.ReadFull(r, itemValue)
+
+		if err != nil {
 			return err
 		}
 
+		//check if value has a suffix of clrf (i.e. \r\n)
+		if !bytes.HasSuffix(itemValue, crlf) {
+			return fmt.Errorf("memcache: corrupt meta get result read")
+		}
+
 		metaRespMetadata := new(MetaResponseMetadata)
-		metaRespMetadata.ReturnItemValue = itemValue
+		metaRespMetadata.ReturnItemValue = itemValue[:size]
 
 		responseMetadata := responseComponents[2:]
 		if err = parseMetaResponseMetadata(responseMetadata, metaRespMetadata); err != nil {
@@ -714,13 +706,10 @@ func parseMetaGetResponse(r *bufio.Reader, cb func(metadata *MetaResponseMetadat
 //will contain t300. Here 300 is the amount of TTL remaining in Seconds
 func parseMetaResponseMetadata(metaResponseMetadata []string, metaRespMetadata *MetaResponseMetadata) error {
 
-	if len(metaResponseMetadata) != 0 {
-		for _, metadata := range metaResponseMetadata {
-			if err := populateMetaResponseMetadata(metadata, metaRespMetadata); err != nil {
-				return err
-			}
+	for _, metadata := range metaResponseMetadata {
+		if err := populateMetaResponseMetadata(metadata, metaRespMetadata); err != nil {
+			return err
 		}
-		return nil
 	}
 
 	return nil

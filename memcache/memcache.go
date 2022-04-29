@@ -135,7 +135,7 @@ var (
 	resultErrorPrefix       = []byte("ERROR")
 	versionPrefix           = []byte("VERSION")
 	metaGetMissPrefix       = []byte("EN")
-	metaGetValuePrefix      = []byte("VA")
+	metaValuePrefix         = []byte("VA")
 )
 
 // New returns a memcache client using the provided server(s)
@@ -645,6 +645,26 @@ func (c *Client) metaGetFromAddr(addr net.Addr, key string, metaGetFlags *MetaGe
 
 }
 
+//reads the item value from response reader given size and
+//returns byte[]
+func getItemValueFromResponse(r *bufio.Reader, size int) ([]byte, error) {
+
+	itemValue := make([]byte, size+2)
+	//populate value
+	_, err := io.ReadFull(r, itemValue)
+
+	if err != nil {
+		return nil, err
+	}
+
+	//check if value has a suffix of clrf (i.e. \r\n)
+	if !bytes.HasSuffix(itemValue, crlf) {
+		return nil, fmt.Errorf("memcache: corrupt meta get result read")
+	}
+
+	return itemValue[:size], nil
+}
+
 //function parses meta get response
 func parseMetaGetResponse(r *bufio.Reader, cb func(metadata *MetaResponseMetadata)) error {
 
@@ -653,60 +673,39 @@ func parseMetaGetResponse(r *bufio.Reader, cb func(metadata *MetaResponseMetadat
 		return err
 	}
 
-	//check for CLIENT_ERROR or SERVER_ERROR
-	if err = getMemCacheErrorFromResponse(response); err != nil {
-		return err
-	}
-
+	switch {
 	//Check if cache miss has occurred
-	if bytes.HasPrefix(response, metaGetMissPrefix) {
+	case bytes.HasPrefix(response, metaGetMissPrefix):
 		return ErrCacheMiss
-	}
-
-	responseComponents := strings.Fields(string(response))
 
 	//metaGet command response will be in the format
 	//VA <size> <flags>*\r\n
 	//<data block>\r\n
-	//Check if at least VA and <size> is present in the response
-	if len(responseComponents) < 2 || !bytes.HasPrefix(response, metaGetValuePrefix) {
-		return fmt.Errorf("memcache: unexpected line in meta get response: %q", response)
+	case bytes.HasPrefix(response, metaValuePrefix):
+		responseComponents := strings.Fields(string(response))
+		var size int
+		//read value size
+		if size, err = strconv.Atoi(responseComponents[1]); err != nil {
+			return err
+		}
+		var itemValue []byte
+		if itemValue, err = getItemValueFromResponse(r, size); err != nil {
+			return err
+		}
+
+		metaRespMetadata := new(MetaResponseMetadata)
+		metaRespMetadata.ReturnItemValue = itemValue
+
+		responseMetadata := responseComponents[2:]
+		if err = parseMetaResponseMetadata(responseMetadata, metaRespMetadata); err != nil {
+			return err
+		}
+		cb(metaRespMetadata)
+
+		return nil
+	default:
+		return fmt.Errorf("memcache: unexpected response line from ms: %q", string(response))
 	}
-
-	var size int
-	//read value size
-	if size, err = strconv.Atoi(responseComponents[1]); err != nil {
-		return err
-	}
-
-	metaRespMetadata := new(MetaResponseMetadata)
-	metaRespMetadata.ReturnItemValue = make([]byte, size+2)
-
-	//populate value
-	_, err = io.ReadFull(r, metaRespMetadata.ReturnItemValue)
-
-	if err != nil {
-		metaRespMetadata.ReturnItemValue = nil
-		return err
-	}
-
-	//check if value has a suffix of clrf (i.e. \r\n)
-	if !bytes.HasSuffix(metaRespMetadata.ReturnItemValue, crlf) {
-		metaRespMetadata.ReturnItemValue = nil
-		return fmt.Errorf("memcache: corrupt meta get result read")
-	}
-
-	metaRespMetadata.ReturnItemValue = metaRespMetadata.ReturnItemValue[:size]
-
-	responseMetadata := responseComponents[2:]
-
-	if err = parseMetaResponseMetadata(responseMetadata, metaRespMetadata); err != nil {
-		return err
-	}
-
-	cb(metaRespMetadata)
-
-	return nil
 }
 
 //function reads the  response from meta commands and returns a struct MetaResponseMetadata
@@ -813,21 +812,6 @@ func convertToUInt32(num string) (*uint32, error) {
 	}
 	uInt32Num = uint32(uInt64Num)
 	return &uInt32Num, nil
-}
-
-func getMemCacheErrorFromResponse(response []byte) error {
-	switch {
-	case bytes.HasPrefix(response, resultErrorPrefix):
-		return errors.New("memcache: unsupported fucntionality/command.")
-	case bytes.HasPrefix(response, resultClientErrorPrefix):
-		errMsg := response[len(resultClientErrorPrefix) : len(response)-2]
-		return errors.New("memcache: client error: " + string(errMsg))
-	case bytes.HasPrefix(response, resultServerErrorPrefix):
-		errMsg := response[len(resultServerErrorPrefix) : len(response)-2]
-		return errors.New("memcache: server error: " + string(errMsg))
-	}
-
-	return nil
 }
 
 //creates the necessary meta get flag commands from the MetaGetFlags struct
